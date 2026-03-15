@@ -30,6 +30,9 @@ flags.DEFINE_float('data_size_fraction', 1.0, 'fraction of training data to use'
 flags.DEFINE_float('phoneme_loss_weight', 0.5, 'weight of auxiliary phoneme prediction loss')
 flags.DEFINE_float('l2', 1e-7, 'weight decay')
 flags.DEFINE_string('output_directory', 'output', 'output directory')
+flags.DEFINE_integer('grad_accum_steps', 1,
+                     'gradient accumulation steps (effective batch = batch_size * grad_accum_steps)')
+flags.DEFINE_bool('pin_memory', True, 'pin DataLoader memory to speed up GPU transfers')
 
 def test(model, testset, device):
     model.eval()
@@ -166,7 +169,13 @@ def train_model(trainset, devset, device, save_sound_outputs=True):
         training_subset = trainset
     else:
         training_subset = trainset.subset(FLAGS.data_size_fraction)
-    dataloader = torch.utils.data.DataLoader(training_subset, pin_memory=(device=='cuda'), collate_fn=devset.collate_raw, num_workers=0, batch_sampler=SizeAwareSampler(training_subset, 256000))
+    dataloader = torch.utils.data.DataLoader(
+        training_subset,
+        pin_memory=(device == 'cuda' and FLAGS.pin_memory),
+        collate_fn=devset.collate_raw,
+        num_workers=0,
+        batch_sampler=SizeAwareSampler(training_subset, 256000),
+    )
 
     n_phones = len(phoneme_inventory)
     model = Model(devset.num_features, devset.num_speech_features, n_phones).to(device)
@@ -191,38 +200,50 @@ def train_model(trainset, devset, device, save_sound_outputs=True):
     def schedule_lr(iteration):
         iteration = iteration + 1
         if iteration <= FLAGS.learning_rate_warmup:
-            set_lr(iteration*target_lr/FLAGS.learning_rate_warmup)
+            set_lr(iteration * target_lr / FLAGS.learning_rate_warmup)
 
     seq_len = 200
+    grad_accum = max(1, FLAGS.grad_accum_steps)
 
     batch_idx = 0
     for epoch_idx in range(n_epochs):
         losses = []
-        for batch in tqdm.tqdm(dataloader, 'Train step', disable=None):
-            optim.zero_grad()
+        optim.zero_grad()
+        for step_idx, batch in enumerate(tqdm.tqdm(dataloader, 'Train step', disable=None)):
             schedule_lr(batch_idx)
 
             X = combine_fixed_length([t.to(device, non_blocking=True) for t in batch['emg']], seq_len)
-            X_raw = combine_fixed_length([t.to(device, non_blocking=True) for t in batch['raw_emg']], seq_len*8)
+            X_raw = combine_fixed_length([t.to(device, non_blocking=True) for t in batch['raw_emg']], seq_len * 8)
             sess = combine_fixed_length([t.to(device, non_blocking=True) for t in batch['session_ids']], seq_len)
 
             # forward/backward under AMP
             with amp.autocast():
                 pred, phoneme_pred = model(X, X_raw, sess)
                 loss, _ = dtw_loss(pred, phoneme_pred, batch)
-            losses.append(loss.item())
+                loss = loss / grad_accum     # scale for accumulation
+            losses.append(loss.item() * grad_accum)
 
             scaler.scale(loss).backward()
-            scaler.step(optim)
-            scaler.update()
+
+            if (step_idx + 1) % grad_accum == 0:
+                scaler.step(optim)
+                scaler.update()
+                optim.zero_grad()
 
             batch_idx += 1
+
+        # flush any remaining accumulated gradients at end of epoch
+        if (step_idx + 1) % grad_accum != 0:
+            scaler.step(optim)
+            scaler.update()
+            optim.zero_grad()
+
         train_loss = np.mean(losses)
         torch.cuda.empty_cache()
         val, phoneme_acc, _ = test(model, devset, device)
         lr_sched.step(val)
         logging.info(f'finished epoch {epoch_idx+1} - validation loss: {val:.4f} training loss: {train_loss:.4f} phoneme accuracy: {phoneme_acc*100:.2f}')
-        torch.save(model.state_dict(), os.path.join(FLAGS.output_directory,'model.pt'))
+        torch.save(model.state_dict(), os.path.join(FLAGS.output_directory, 'model.pt'))
         if save_sound_outputs:
             save_output(model, devset[0], os.path.join(FLAGS.output_directory, f'epoch_{epoch_idx}_output.wav'), device, devset.mfcc_norm, vocoder)
 
