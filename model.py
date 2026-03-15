@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from torch.utils.checkpoint import checkpoint
 
 from scans import selective_scan
 
@@ -42,11 +43,12 @@ class ModelArgs:
     d_state: int = 16
     expand: int = 2
     dt_rank: Union[int, str] = 'auto'
-    d_conv: int = 4 
+    d_conv: int = 4
     pad_vocab_size_multiple: int = 8
     conv_bias: bool = True
     bias: bool = False
     scan_mode: str = 'cumsum'
+    use_checkpoint: bool = False   # gradient checkpointing per residual block
     
     def __post_init__(self):
         self.d_inner = int(self.expand * self.d_model)
@@ -172,6 +174,11 @@ class ResidualBlock(nn.Module):
                 [Norm -> Mamba -> Add] -> [Norm -> Mamba -> Add] -> [Norm -> Mamba -> Add] -> ....
             
         """
+        if self.args.use_checkpoint and self.training:
+            return checkpoint(self._inner_forward, x, use_reentrant=False)
+        return self._inner_forward(x)
+
+    def _inner_forward(self, x):
         return self.mixer(self.norm(x)) + x
             
 
