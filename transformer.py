@@ -25,11 +25,9 @@ class TransformerEncoderLayer(nn.Module):
         >>> out = encoder_layer(src)
     """
 
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, relative_positional=True, relative_positional_distance=100, batch_first=False):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, relative_positional=True, relative_positional_distance=100):
         super(TransformerEncoderLayer, self).__init__()
         self.self_attn = MultiHeadAttention(d_model, nhead, dropout=dropout, relative_positional=relative_positional, relative_positional_distance=relative_positional_distance)
-        # inform nn.TransformerEncoder about layout
-        self.self_attn.batch_first = batch_first
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -64,8 +62,6 @@ class TransformerEncoderLayer(nn.Module):
 class MultiHeadAttention(nn.Module):
   def __init__(self, d_model=256, n_head=4, dropout=0.1, relative_positional=True, relative_positional_distance=100):
     super().__init__()
-    # mimic PyTorch's MultiheadAttention attributes for compatibility
-    self.batch_first = False
     self.d_model = d_model
     self.n_head = n_head
     d_qkv = d_model // n_head
