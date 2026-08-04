@@ -4,7 +4,7 @@
 
 ## 專案來源與註記
 
-- 本 README 內容架構與大部分技術說明，**改寫自 [dgaddy/silent_speech](https://github.com/dgaddy/silent_speech) 專案**。
+- 本 README 內容架構與大部分技術說明，**來自 [dgaddy/silent_speech](https://github.com/dgaddy/silent_speech) 專案**，本引用僅用於emg資料前處理與批次訓練使用。
 - 原始研究與基礎流程請參考原專案與其論文資源。
 - 本倉庫為衍生與延伸實作，並加入近期模型與推論系統調整。
 
