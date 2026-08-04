@@ -13,11 +13,13 @@ from read_emg import EMGDataset
 from asr_evaluation import evaluate
 from data_utils import phoneme_inventory, print_confusion
 from vocoder import Vocoder
+from quantize_int16 import load_quantized_model
 
 from absl import flags
 FLAGS = flags.FLAGS
 flags.DEFINE_list('models', [], 'identifiers of models to evaluate')
 flags.DEFINE_boolean('dev', False, 'evaluate dev insead of test')
+flags.DEFINE_boolean('quantized', False, '是否使用 INT16 量化模型')
 
 class EnsembleModel(nn.Module):
     def __init__(self, models):
@@ -47,9 +49,12 @@ def main():
 
     models = []
     for fname in FLAGS.models:
-        state_dict = torch.load(fname)
         model = Model(testset.num_features, testset.num_speech_features, len(phoneme_inventory)).to(device)
-        model.load_state_dict(state_dict)
+        if FLAGS.quantized:
+            load_quantized_model(model, fname, device)
+        else:
+            state_dict = torch.load(fname)
+            model.load_state_dict(state_dict)
         models.append(model)
     ensemble = EnsembleModel(models)
 

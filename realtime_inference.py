@@ -39,6 +39,7 @@ from vocoder import Vocoder, StreamingVocoder
 from emg_simulator import EMGSimulator
 from read_emg import EMGDataset
 from streaming_pipeline import StreamingPipeline, AUDIO_SR
+from quantize_int16 import load_quantized_model
 
 from absl import flags
 FLAGS = flags.FLAGS
@@ -54,9 +55,12 @@ flags.DEFINE_string('emg_file', None,
                     '自訂 EMG 檔案路徑 (.npy, shape=(T,8)). 設定後忽略 sample_index')
 flags.DEFINE_boolean('list_samples', False,
                      '列出資料集中所有可用樣本後結束')
-flags.DEFINE_string('model_path',
-                    'models/transduction_model/model.pt',
-                    '模型檔案路徑')
+try:
+    flags.DEFINE_string('model_path',
+                        'models/transduction_model/model.pt',
+                        '模型檔案路徑')
+except flags.DuplicateFlagError:
+    pass
 flags.DEFINE_string('streaming_output',
                     'output/streaming_output.wav',
                     '串流輸出 WAV 路徑')
@@ -70,6 +74,11 @@ flags.DEFINE_boolean('save_wav', True,
                      '是否儲存 WAV 檔案')
 flags.DEFINE_boolean('save_chunks', False,
                      '是否儲存每段 vocoder 輸出為個別 WAV')
+
+try:
+    flags.DEFINE_boolean('quantized', False, '是否使用 INT16 量化模型')
+except flags.DuplicateFlagError:
+    pass
 
 
 def run_batch_inference(model, datapoint, device, audio_normalizer, vocoder):
@@ -153,8 +162,11 @@ def main():
     n_phones = len(phoneme_inventory)
     model = Model(devset.num_features, devset.num_speech_features,
                   n_phones).to(device)
-    state_dict = torch.load(FLAGS.model_path, map_location=device)
-    model.load_state_dict(state_dict)
+    if FLAGS.quantized:
+        load_quantized_model(model, FLAGS.model_path, device)
+    else:
+        state_dict = torch.load(FLAGS.model_path, map_location=device)
+        model.load_state_dict(state_dict)
     model.eval()
 
     # ── 載入 Vocoder ──────────────────────────────────────────
@@ -176,7 +188,7 @@ def main():
     chunk_dir = None
     if FLAGS.save_chunks:
         chunk_dir = os.path.join(out_dir, 'chunks')
-        logging.info(f'📂 每段音訊將存到: {chunk_dir}/')
+        logging.info(f' 每段音訊將存到: {chunk_dir}/')
 
     pipeline = StreamingPipeline(
         model=model,
@@ -189,13 +201,7 @@ def main():
     )
 
     # ── 啟動 Pipeline ─────────────────────────────────────
-    logging.info('=' * 60)
-    logging.info(' 啟動多執行緒即時 EMG → 語音 Pipeline')
-    logging.info('  Thread 1: EMG 擷取')
-    logging.info('  Thread 2: 前處理')
-    logging.info('  Thread 3: 推論 (因果 CNN → Stateful Mamba → Vocoder)')
-    logging.info(f'  播放模式: {FLAGS.play_mode}')
-    logging.info('=' * 60)
+
 
     start_time = time.time()
 
@@ -216,22 +222,16 @@ def main():
         else:
             infer_time = total_time
 
-        logging.info('=' * 60)
-        logging.info(f'   推論時間:   {infer_time:.2f}s')
-        logging.info(f'   總時間:     {total_time:.2f}s (含播放)')
-        logging.info(f'   音訊長度:   {audio_dur:.2f}s')
-        logging.info(f'   推論 RTF:   {infer_time / audio_dur:.3f}x')
 
         if FLAGS.save_wav:
             sf.write(FLAGS.streaming_output, full_audio, AUDIO_SR)
-            logging.info(f'✅ WAV 已儲存: {FLAGS.streaming_output}')
         logging.info('=' * 60)
     else:
         logging.warning(' 未產生任何音訊')
         return
 
     # ── (可選) 批次推論比較 ───────────────────────────────────
-    if FLAGS.compare_batch and sample is not None:
+    if FLAGS.compare_batch and sample is None:
         logging.info('執行批次推論進行比較...')
         batch_audio = run_batch_inference(
             model, sample, device, devset.mfcc_norm, vocoder

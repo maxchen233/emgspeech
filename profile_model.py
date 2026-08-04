@@ -25,6 +25,7 @@ from architecture import Model
 from data_utils import phoneme_inventory
 from vocoder import Vocoder, StreamingVocoder
 from read_emg import EMGDataset
+from quantize_int16 import load_quantized_model
 
 from absl import flags
 FLAGS = flags.FLAGS
@@ -36,6 +37,11 @@ flags.DEFINE_string('profile_output', 'output/profile_report.html',
                     '分析報告輸出路徑')
 flags.DEFINE_integer('warmup_runs', 5, '暖機次數')
 flags.DEFINE_integer('benchmark_runs', 20, '測量次數')
+
+try:
+    flags.DEFINE_boolean('quantized', False, '是否使用 INT16 量化模型')
+except flags.DuplicateFlagError:
+    pass
 
 
 def count_parameters(module, name=""):
@@ -253,6 +259,7 @@ def generate_html_report(param_info, latency_info, memory_info,
 
     peak_mb = f"{memory_info.get('peak_mb', 0):.0f}"
     fp16_mb = f"{total_size_mb/2:.1f}"
+    int16_mb = f"{total_size_mb/2:.1f}"
     int8_mb = f"{total_size_mb/4:.1f}"
 
     html = f"""<!DOCTYPE html>
@@ -507,8 +514,11 @@ def main():
     n_phones = len(phoneme_inventory)
     model = Model(devset.num_features, devset.num_speech_features,
                   n_phones).to(device)
-    state_dict = torch.load(FLAGS.model_path, map_location=device)
-    model.load_state_dict(state_dict)
+    if FLAGS.quantized:
+        load_quantized_model(model, FLAGS.model_path, device)
+    else:
+        state_dict = torch.load(FLAGS.model_path, map_location=device)
+        model.load_state_dict(state_dict)
     model.eval()
 
     print('載入 HiFi-GAN...')

@@ -16,6 +16,7 @@ from align import align_from_distances
 from asr_evaluation import evaluate
 from data_utils import phoneme_inventory, decollate_tensor, combine_fixed_length
 from vocoder import Vocoder
+from quantize_int16 import save_quantized_model, load_quantized_model
 
 from absl import flags
 FLAGS = flags.FLAGS
@@ -29,6 +30,7 @@ flags.DEFINE_float('data_size_fraction', 1.0, 'fraction of training data to use'
 flags.DEFINE_float('phoneme_loss_weight', 0.5, 'weight of auxiliary phoneme prediction loss')
 flags.DEFINE_float('l2', 1e-7, 'weight decay')
 flags.DEFINE_string('output_directory', 'output', 'output directory')
+flags.DEFINE_boolean('quantized', False, '是否使用 INT16 量化模型')
 
 def test(model, testset, device):
     model.eval()
@@ -169,8 +171,11 @@ def train_model(trainset, devset, device, save_sound_outputs=True):
     model = Model(devset.num_features, devset.num_speech_features, n_phones).to(device)
 
     if FLAGS.start_training_from is not None:
-        state_dict = torch.load(FLAGS.start_training_from)
-        model.load_state_dict(state_dict, strict=False)
+        if FLAGS.quantized:
+            load_quantized_model(model, FLAGS.start_training_from, device)
+        else:
+            state_dict = torch.load(FLAGS.start_training_from)
+            model.load_state_dict(state_dict, strict=False)
 
     if save_sound_outputs:
         vocoder = Vocoder()
@@ -218,11 +223,15 @@ def train_model(trainset, devset, device, save_sound_outputs=True):
         logging.info(f'finished epoch {epoch_idx+1} - validation loss: {val:.4f} training loss: {train_loss:.4f} phoneme accuracy: {phoneme_acc*100:.2f}')
         
         torch.save(model.state_dict(), os.path.join(FLAGS.output_directory,'model.pt'))
+        # 同時儲存 INT16 量化版本
+        int16_path = os.path.join(FLAGS.output_directory, 'model_int16.pt')
+        save_quantized_model(model.state_dict(), int16_path)
+        logging.info(f'INT16 量化模型已儲存: {int16_path}')
         if save_sound_outputs:
            # 加入這行！讓終端機印出它正在生成哪一句話：
-            print(f"\n🎧 正在生成驗證音訊...")
-            print(f"👉 檔案編號: {devset[0]['file_label']}")
-            print(f"👉 真實文字: {devset[0]['text']}\n")
+            print(f"\n 正在生成驗證音訊...")
+            print(f" 檔案編號: {devset[0]['file_label']}")
+            print(f" 真實文字: {devset[0]['text']}\n")
             
             save_output(model, devset[0], os.path.join(FLAGS.output_directory, f'epoch_{epoch_idx}_output.wav'), device, devset.mfcc_norm, vocoder)
         if save_sound_outputs:

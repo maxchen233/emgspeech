@@ -80,10 +80,16 @@ def _realtime_playback_worker(audio_q, sr):
 class StreamingPipeline:
     def __init__(self, model, streaming_vocoder, audio_normalizer,
                  device, vocoder_chunk_size=10, play_mode='paplay',
-                 chunk_output_dir=None):
+                 chunk_output_dir=None,
+                 on_emg_chunk=None, on_audio_chunk=None,
+                 on_mel_chunk=None, on_progress=None):
         """
         Args:
             play_mode: 'paplay' | 'realtime' | 'none'
+            on_emg_chunk: callback(raw_emg_np) — called when an EMG chunk enters
+            on_audio_chunk: callback(audio_np) — called when vocoder produces audio
+            on_mel_chunk: callback(mel_np) — called when model produces mel frames
+            on_progress: callback(chunk_idx, total_chunks) — for progress tracking
         """
         self.model = model
         self.streaming_vocoder = streaming_vocoder
@@ -93,6 +99,12 @@ class StreamingPipeline:
         self.play_mode = play_mode
         self.chunk_output_dir = chunk_output_dir
 
+        # Optional callbacks for UI / observers
+        self.on_emg_chunk = on_emg_chunk
+        self.on_audio_chunk = on_audio_chunk
+        self.on_mel_chunk = on_mel_chunk
+        self.on_progress = on_progress
+
         self.emg_queue = queue.Queue(maxsize=64)
         self.processed_queue = queue.Queue(maxsize=64)
 
@@ -100,6 +112,7 @@ class StreamingPipeline:
         self.audio_segments = []
         self.total_audio_samples = 0
         self.chunk_count = 0
+        self.total_chunks = 0
         self.vocoder_count = 0
         self.inference_done_time = None
 
@@ -114,6 +127,10 @@ class StreamingPipeline:
         self.model.eval()
         self.model_state = self.model.init_streaming_state(self.device)
 
+        # Store total_chunks for progress tracking
+        if hasattr(emg_source, 'total_chunks'):
+            self.total_chunks = emg_source.total_chunks
+
         # 啟動即時播放 process
         if self.play_mode == 'realtime':
             self._rt_queue = multiprocessing.Queue()
@@ -123,7 +140,7 @@ class StreamingPipeline:
                 daemon=True,
             )
             self._rt_proc.start()
-            logging.info('🔊 即時播放 process 已啟動 (pacat)')
+            logging.info('')
 
         self._t1 = threading.Thread(target=self._emg_capture_loop,
                                      args=(emg_source,), daemon=True)
@@ -147,7 +164,7 @@ class StreamingPipeline:
             self._rt_proc.join(timeout=30)
             if self._rt_proc.is_alive():
                 self._rt_proc.kill()
-            logging.info('🔊 即時播放結束')
+            logging.info('')
 
         # paplay 模式: 推論完後播放完整 WAV
         if self.play_mode == 'paplay' and wav_path and len(self.audio_segments) > 0:
@@ -171,7 +188,7 @@ class StreamingPipeline:
 
         full_audio = self.get_full_audio()
         sf.write(wav_path, full_audio, AUDIO_SR)
-        logging.info(f'🔊 開始播放: {wav_path}')
+        logging.info(f'')
 
         try:
             proc = subprocess.Popen(
@@ -179,7 +196,7 @@ class StreamingPipeline:
                 stderr=subprocess.DEVNULL,
             )
             proc.wait()
-            logging.info('🔊 播放結束')
+            logging.info('')
         except Exception as e:
             logging.warning(f'播放錯誤: {e}')
 
@@ -193,6 +210,11 @@ class StreamingPipeline:
         try:
             for chunk in emg_source:
                 self.emg_queue.put(chunk)
+                if self.on_emg_chunk is not None:
+                    try:
+                        self.on_emg_chunk(chunk)
+                    except Exception:
+                        pass
         except Exception as e:
             logging.error(f'EMG 擷取錯誤: {e}')
         finally:
@@ -234,6 +256,12 @@ class StreamingPipeline:
                 mel_frames = mel.squeeze(0)
                 mel_frames = self.audio_normalizer.inverse(mel_frames.cpu())
                 mel_pending.append(mel_frames)
+
+                if self.on_mel_chunk is not None:
+                    try:
+                        self.on_mel_chunk(mel_frames.numpy())
+                    except Exception:
+                        pass
                 total_pending = sum(m.shape[0] for m in mel_pending)
 
                 if total_pending >= self.vocoder_chunk_size:
@@ -252,6 +280,13 @@ class StreamingPipeline:
                         # 即時播放
                         self._send_realtime(audio)
 
+                        # UI callback
+                        if self.on_audio_chunk is not None:
+                            try:
+                                self.on_audio_chunk(audio)
+                            except Exception:
+                                pass
+
                         # 存每段音訊
                         if self.chunk_output_dir:
                             chunk_path = os.path.join(
@@ -264,10 +299,17 @@ class StreamingPipeline:
                         audio_ms = len(audio) / AUDIO_SR * 1000
                         logging.info(
                             f'Chunk {self.chunk_count:4d} | '
-                            f'延遲 {dt*1000:6.1f}ms | '
-                            f'🔊 {audio_ms:6.1f}ms | '
-                            f'累計 {self.total_audio_samples/AUDIO_SR:.2f}s'
+                            f'delay {dt*1000:6.1f}ms | '
+                            f'{audio_ms:6.1f}ms | '
+                            f'total {self.total_audio_samples/AUDIO_SR:.2f}s'
                         )
+
+                # Progress callback
+                if self.on_progress is not None:
+                    try:
+                        self.on_progress(self.chunk_count, self.total_chunks)
+                    except Exception:
+                        pass
 
             # Flush
             if mel_pending:
@@ -279,16 +321,24 @@ class StreamingPipeline:
                     self.audio_segments.append(audio.copy())
                     self.total_audio_samples += len(audio)
                     self._send_realtime(audio)
+                    if self.on_audio_chunk is not None:
+                        try:
+                            self.on_audio_chunk(audio)
+                        except Exception:
+                            pass
 
             tail = self.streaming_vocoder.flush()
             if len(tail) > 0:
                 self.audio_segments.append(tail.copy())
                 self.total_audio_samples += len(tail)
                 self._send_realtime(tail)
+                if self.on_audio_chunk is not None:
+                    try:
+                        self.on_audio_chunk(tail)
+                    except Exception:
+                        pass
 
         except Exception as e:
             logging.error(f'推論錯誤: {e}', exc_info=True)
 
         self.inference_done_time = time.time()
-        logging.info(f'✅ 推論完成 ({self.chunk_count} chunks, '
-                     f'{self.total_audio_samples/AUDIO_SR:.2f}s 音訊)')
