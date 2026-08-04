@@ -11,7 +11,7 @@ from models import Generator
 
 from absl import flags
 FLAGS = flags.FLAGS
-flags.DEFINE_string('hifigan_checkpoint', None, 'filename of hifi-gan generator checkpoint')
+flags.DEFINE_string('hifigan_checkpoint', 'hifigan_finetuned/checkpoint', 'filename of hifi-gan generator checkpoint')
 
 HOP_SIZE = 256
 TRIM_FRAMES = 8  # 前後截掉的 mel 幀數

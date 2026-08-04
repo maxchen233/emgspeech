@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from mamba_ssm import Mamba
+from mamba_ssm.modules.mamba_simple import Mamba
 
 from absl import flags
 FLAGS = flags.FLAGS

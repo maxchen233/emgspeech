@@ -1,0 +1,59 @@
+============================================================
+INT16 Quantization-Aware Training (QAT)
+============================================================
+Train: 8055 | Dev: 200
+Device: cuda
+✅ 載入預訓練模型: ./models_mamba1/transduction_model/model.pt
+模型參數量: 8,160,384 | FP32=31.1MB
+   量化節點: 12 個包裝層 + 4 個 Mamba hook
+🔧 已插入 INT16 fake-quantize 節點 (per_channel=True)
+📏 FP32 baseline val_loss = 0.8112
+📏 INT16 (量化前QAT) val_loss = 0.8112
+📏 量化精度落差 = +0.0000
+
+🚀 開始 INT16 QAT: 40 epochs, lr=0.0001
+Epoch 1/40 | train=0.7080 | val=0.7970
+  💾 Best model saved (val=0.7970)
+Epoch 2/40 | train=0.7005 | val=0.7986
+Epoch 3/40 | train=0.6982 | val=0.7979
+Epoch 4/40 | train=0.6962 | val=0.7978
+Epoch 5/40 | train=0.6947 | val=0.7976
+Epoch 6/40 | train=0.6932 | val=0.7998
+Epoch 7/40 | train=0.6920 | val=0.7963
+  💾 Best model saved (val=0.7963)
+Epoch 8/40 | train=0.6914 | val=0.7982
+Epoch 9/40 | train=0.6897 | val=0.7990
+Epoch 10/40 | train=0.6886 | val=0.7968
+Epoch 11/40 | train=0.6880 | val=0.7986
+Epoch 12/40 | train=0.6867 | val=0.7984
+Epoch 13/40 | train=0.6863 | val=0.7987
+Epoch 14/40 | train=0.6840 | val=0.7975
+Epoch 15/40 | train=0.6824 | val=0.7982
+============================================================
+INT16 Quantization-Aware Training (QAT)
+============================================================
+Train: 8055 | Dev: 200
+Device: cuda
+✅ 載入預訓練模型: ./models_mamba1/transduction_model/model.pt
+模型參數量: 8,160,384 | FP32=31.1MB
+   量化節點: 12 個包裝層 + 4 個 Mamba hook
+🔧 已插入 INT16 fake-quantize 節點 (per_channel=True)
+📏 FP32 baseline val_loss = 0.8112
+📏 INT16 (量化前QAT) val_loss = 0.8112
+📏 量化精度落差 = +0.0000
+⏩ 從 Epoch 15 繼續 (best_val=0.7963)
+
+🚀 開始 INT16 QAT: 18 epochs, lr=0.0001
+Epoch 16/18 | train=0.6842 | val=0.7972
+Epoch 17/18 | train=0.6827 | val=0.7993
+Epoch 18/18 | train=0.6826 | val=0.7978
+
+✅ QAT 訓練完成! Best val=0.7963
+
+📊 量化匯出結果:
+   FP32 模型大小:  31.1 MB
+   INT16 模型大小: 15.8 MB
+   壓縮比: 1.97x
+   量化權重: 32 個 tensor
+   非量化參數: 83 個 tensor (norm/bias)
+   匯出路徑: output_qat_int16/qat_model_int16.pt

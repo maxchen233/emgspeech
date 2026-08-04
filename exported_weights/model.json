@@ -1,0 +1,745 @@
+{
+  "format": "silentspeech_mamba_v1",
+  "d_model": 512,
+  "num_layers": 4,
+  "d_state": 8,
+  "d_conv": 4,
+  "d_inner": 512,
+  "dt_rank": 32,
+  "num_outs": 80,
+  "num_aux_outs": 48,
+  "tensors": {
+    "res0.conv1.weight": {
+      "file": "res0_conv1_weight.bin",
+      "shape": [
+        512,
+        8,
+        3
+      ],
+      "numel": 12288,
+      "dtype": "float32"
+    },
+    "res0.conv1.bias": {
+      "file": "res0_conv1_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res0.conv2.weight": {
+      "file": "res0_conv2_weight.bin",
+      "shape": [
+        512,
+        512,
+        3
+      ],
+      "numel": 786432,
+      "dtype": "float32"
+    },
+    "res0.conv2.bias": {
+      "file": "res0_conv2_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res0.skip.weight": {
+      "file": "res0_skip_weight.bin",
+      "shape": [
+        512,
+        8,
+        1
+      ],
+      "numel": 4096,
+      "dtype": "float32"
+    },
+    "res0.skip.bias": {
+      "file": "res0_skip_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res0.has_skip": true,
+    "res0.stride": 2,
+    "res1.conv1.weight": {
+      "file": "res1_conv1_weight.bin",
+      "shape": [
+        512,
+        512,
+        3
+      ],
+      "numel": 786432,
+      "dtype": "float32"
+    },
+    "res1.conv1.bias": {
+      "file": "res1_conv1_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res1.conv2.weight": {
+      "file": "res1_conv2_weight.bin",
+      "shape": [
+        512,
+        512,
+        3
+      ],
+      "numel": 786432,
+      "dtype": "float32"
+    },
+    "res1.conv2.bias": {
+      "file": "res1_conv2_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res1.skip.weight": {
+      "file": "res1_skip_weight.bin",
+      "shape": [
+        512,
+        512,
+        1
+      ],
+      "numel": 262144,
+      "dtype": "float32"
+    },
+    "res1.skip.bias": {
+      "file": "res1_skip_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res1.has_skip": true,
+    "res1.stride": 2,
+    "res2.conv1.weight": {
+      "file": "res2_conv1_weight.bin",
+      "shape": [
+        512,
+        512,
+        3
+      ],
+      "numel": 786432,
+      "dtype": "float32"
+    },
+    "res2.conv1.bias": {
+      "file": "res2_conv1_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res2.conv2.weight": {
+      "file": "res2_conv2_weight.bin",
+      "shape": [
+        512,
+        512,
+        3
+      ],
+      "numel": 786432,
+      "dtype": "float32"
+    },
+    "res2.conv2.bias": {
+      "file": "res2_conv2_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res2.skip.weight": {
+      "file": "res2_skip_weight.bin",
+      "shape": [
+        512,
+        512,
+        1
+      ],
+      "numel": 262144,
+      "dtype": "float32"
+    },
+    "res2.skip.bias": {
+      "file": "res2_skip_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "res2.has_skip": true,
+    "res2.stride": 2,
+    "w_raw_in.weight": {
+      "file": "w_raw_in_weight.bin",
+      "shape": [
+        512,
+        512
+      ],
+      "numel": 262144,
+      "dtype": "float32"
+    },
+    "w_raw_in.bias": {
+      "file": "w_raw_in_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba0.norm.weight": {
+      "file": "mamba0_norm_weight.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba0.norm.bias": {
+      "file": "mamba0_norm_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba0.in_proj.weight": {
+      "file": "mamba0_in_proj_weight.bin",
+      "shape": [
+        1024,
+        512
+      ],
+      "numel": 524288,
+      "dtype": "float32"
+    },
+    "mamba0.conv1d.weight": {
+      "file": "mamba0_conv1d_weight.bin",
+      "shape": [
+        512,
+        1,
+        4
+      ],
+      "numel": 2048,
+      "dtype": "float32"
+    },
+    "mamba0.conv1d.bias": {
+      "file": "mamba0_conv1d_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba0.x_proj.weight": {
+      "file": "mamba0_x_proj_weight.bin",
+      "shape": [
+        48,
+        512
+      ],
+      "numel": 24576,
+      "dtype": "float32"
+    },
+    "mamba0.dt_proj.weight": {
+      "file": "mamba0_dt_proj_weight.bin",
+      "shape": [
+        512,
+        32
+      ],
+      "numel": 16384,
+      "dtype": "float32"
+    },
+    "mamba0.dt_proj.bias": {
+      "file": "mamba0_dt_proj_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba0.A_log": {
+      "file": "mamba0_A_log.bin",
+      "shape": [
+        512,
+        8
+      ],
+      "numel": 4096,
+      "dtype": "float32"
+    },
+    "mamba0.D": {
+      "file": "mamba0_D.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba0.out_proj.weight": {
+      "file": "mamba0_out_proj_weight.bin",
+      "shape": [
+        512,
+        512
+      ],
+      "numel": 262144,
+      "dtype": "float32"
+    },
+    "mamba1.norm.weight": {
+      "file": "mamba1_norm_weight.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba1.norm.bias": {
+      "file": "mamba1_norm_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba1.in_proj.weight": {
+      "file": "mamba1_in_proj_weight.bin",
+      "shape": [
+        1024,
+        512
+      ],
+      "numel": 524288,
+      "dtype": "float32"
+    },
+    "mamba1.conv1d.weight": {
+      "file": "mamba1_conv1d_weight.bin",
+      "shape": [
+        512,
+        1,
+        4
+      ],
+      "numel": 2048,
+      "dtype": "float32"
+    },
+    "mamba1.conv1d.bias": {
+      "file": "mamba1_conv1d_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba1.x_proj.weight": {
+      "file": "mamba1_x_proj_weight.bin",
+      "shape": [
+        48,
+        512
+      ],
+      "numel": 24576,
+      "dtype": "float32"
+    },
+    "mamba1.dt_proj.weight": {
+      "file": "mamba1_dt_proj_weight.bin",
+      "shape": [
+        512,
+        32
+      ],
+      "numel": 16384,
+      "dtype": "float32"
+    },
+    "mamba1.dt_proj.bias": {
+      "file": "mamba1_dt_proj_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba1.A_log": {
+      "file": "mamba1_A_log.bin",
+      "shape": [
+        512,
+        8
+      ],
+      "numel": 4096,
+      "dtype": "float32"
+    },
+    "mamba1.D": {
+      "file": "mamba1_D.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba1.out_proj.weight": {
+      "file": "mamba1_out_proj_weight.bin",
+      "shape": [
+        512,
+        512
+      ],
+      "numel": 262144,
+      "dtype": "float32"
+    },
+    "mamba2.norm.weight": {
+      "file": "mamba2_norm_weight.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba2.norm.bias": {
+      "file": "mamba2_norm_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba2.in_proj.weight": {
+      "file": "mamba2_in_proj_weight.bin",
+      "shape": [
+        1024,
+        512
+      ],
+      "numel": 524288,
+      "dtype": "float32"
+    },
+    "mamba2.conv1d.weight": {
+      "file": "mamba2_conv1d_weight.bin",
+      "shape": [
+        512,
+        1,
+        4
+      ],
+      "numel": 2048,
+      "dtype": "float32"
+    },
+    "mamba2.conv1d.bias": {
+      "file": "mamba2_conv1d_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba2.x_proj.weight": {
+      "file": "mamba2_x_proj_weight.bin",
+      "shape": [
+        48,
+        512
+      ],
+      "numel": 24576,
+      "dtype": "float32"
+    },
+    "mamba2.dt_proj.weight": {
+      "file": "mamba2_dt_proj_weight.bin",
+      "shape": [
+        512,
+        32
+      ],
+      "numel": 16384,
+      "dtype": "float32"
+    },
+    "mamba2.dt_proj.bias": {
+      "file": "mamba2_dt_proj_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba2.A_log": {
+      "file": "mamba2_A_log.bin",
+      "shape": [
+        512,
+        8
+      ],
+      "numel": 4096,
+      "dtype": "float32"
+    },
+    "mamba2.D": {
+      "file": "mamba2_D.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba2.out_proj.weight": {
+      "file": "mamba2_out_proj_weight.bin",
+      "shape": [
+        512,
+        512
+      ],
+      "numel": 262144,
+      "dtype": "float32"
+    },
+    "mamba3.norm.weight": {
+      "file": "mamba3_norm_weight.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba3.norm.bias": {
+      "file": "mamba3_norm_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba3.in_proj.weight": {
+      "file": "mamba3_in_proj_weight.bin",
+      "shape": [
+        1024,
+        512
+      ],
+      "numel": 524288,
+      "dtype": "float32"
+    },
+    "mamba3.conv1d.weight": {
+      "file": "mamba3_conv1d_weight.bin",
+      "shape": [
+        512,
+        1,
+        4
+      ],
+      "numel": 2048,
+      "dtype": "float32"
+    },
+    "mamba3.conv1d.bias": {
+      "file": "mamba3_conv1d_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba3.x_proj.weight": {
+      "file": "mamba3_x_proj_weight.bin",
+      "shape": [
+        48,
+        512
+      ],
+      "numel": 24576,
+      "dtype": "float32"
+    },
+    "mamba3.dt_proj.weight": {
+      "file": "mamba3_dt_proj_weight.bin",
+      "shape": [
+        512,
+        32
+      ],
+      "numel": 16384,
+      "dtype": "float32"
+    },
+    "mamba3.dt_proj.bias": {
+      "file": "mamba3_dt_proj_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba3.A_log": {
+      "file": "mamba3_A_log.bin",
+      "shape": [
+        512,
+        8
+      ],
+      "numel": 4096,
+      "dtype": "float32"
+    },
+    "mamba3.D": {
+      "file": "mamba3_D.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "mamba3.out_proj.weight": {
+      "file": "mamba3_out_proj_weight.bin",
+      "shape": [
+        512,
+        512
+      ],
+      "numel": 262144,
+      "dtype": "float32"
+    },
+    "final_norm.weight": {
+      "file": "final_norm_weight.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "final_norm.bias": {
+      "file": "final_norm_bias.bin",
+      "shape": [
+        512
+      ],
+      "numel": 512,
+      "dtype": "float32"
+    },
+    "w_out.weight": {
+      "file": "w_out_weight.bin",
+      "shape": [
+        80,
+        512
+      ],
+      "numel": 40960,
+      "dtype": "float32"
+    },
+    "w_out.bias": {
+      "file": "w_out_bias.bin",
+      "shape": [
+        80
+      ],
+      "numel": 80,
+      "dtype": "float32"
+    },
+    "w_aux.weight": {
+      "file": "w_aux_weight.bin",
+      "shape": [
+        48,
+        512
+      ],
+      "numel": 24576,
+      "dtype": "float32"
+    },
+    "w_aux.bias": {
+      "file": "w_aux_bias.bin",
+      "shape": [
+        48
+      ],
+      "numel": 48,
+      "dtype": "float32"
+    },
+    "golden.input": {
+      "file": "golden_input.bin",
+      "shape": [
+        128,
+        8
+      ],
+      "numel": 1024,
+      "dtype": "float32"
+    },
+    "golden.after_res0": {
+      "file": "golden_after_res0.bin",
+      "shape": [
+        64,
+        512
+      ],
+      "numel": 32768,
+      "dtype": "float32"
+    },
+    "golden.after_res1": {
+      "file": "golden_after_res1.bin",
+      "shape": [
+        32,
+        512
+      ],
+      "numel": 16384,
+      "dtype": "float32"
+    },
+    "golden.after_res2": {
+      "file": "golden_after_res2.bin",
+      "shape": [
+        16,
+        512
+      ],
+      "numel": 8192,
+      "dtype": "float32"
+    },
+    "golden.after_w_raw_in": {
+      "file": "golden_after_w_raw_in.bin",
+      "shape": [
+        16,
+        512
+      ],
+      "numel": 8192,
+      "dtype": "float32"
+    },
+    "golden.after_mamba0": {
+      "file": "golden_after_mamba0.bin",
+      "shape": [
+        16,
+        512
+      ],
+      "numel": 8192,
+      "dtype": "float32"
+    },
+    "golden.after_mamba1": {
+      "file": "golden_after_mamba1.bin",
+      "shape": [
+        16,
+        512
+      ],
+      "numel": 8192,
+      "dtype": "float32"
+    },
+    "golden.after_mamba2": {
+      "file": "golden_after_mamba2.bin",
+      "shape": [
+        16,
+        512
+      ],
+      "numel": 8192,
+      "dtype": "float32"
+    },
+    "golden.after_mamba3": {
+      "file": "golden_after_mamba3.bin",
+      "shape": [
+        16,
+        512
+      ],
+      "numel": 8192,
+      "dtype": "float32"
+    },
+    "golden.after_final_norm": {
+      "file": "golden_after_final_norm.bin",
+      "shape": [
+        16,
+        512
+      ],
+      "numel": 8192,
+      "dtype": "float32"
+    },
+    "golden.mel_output": {
+      "file": "golden_mel_output.bin",
+      "shape": [
+        16,
+        80
+      ],
+      "numel": 1280,
+      "dtype": "float32"
+    },
+    "golden.aux_output": {
+      "file": "golden_aux_output.bin",
+      "shape": [
+        16,
+        48
+      ],
+      "numel": 768,
+      "dtype": "float32"
+    },
+    "golden.mel_stream_output": {
+      "file": "golden_mel_stream_output.bin",
+      "shape": [
+        16,
+        80
+      ],
+      "numel": 1280,
+      "dtype": "float32"
+    }
+  }
+}

@@ -39,7 +39,7 @@ from vocoder import Vocoder, StreamingVocoder
 from emg_simulator import EMGSimulator
 from read_emg import EMGDataset
 from streaming_pipeline import StreamingPipeline, AUDIO_SR
-from quantize_int16 import load_quantized_model
+from cpp_streaming_pipeline import CppStreamingPipeline
 
 from absl import flags
 FLAGS = flags.FLAGS
@@ -55,30 +55,31 @@ flags.DEFINE_string('emg_file', None,
                     '自訂 EMG 檔案路徑 (.npy, shape=(T,8)). 設定後忽略 sample_index')
 flags.DEFINE_boolean('list_samples', False,
                      '列出資料集中所有可用樣本後結束')
-try:
-    flags.DEFINE_string('model_path',
-                        'models/transduction_model/model.pt',
-                        '模型檔案路徑')
-except flags.DuplicateFlagError:
-    pass
+flags.DEFINE_string('model_path',
+                    'models_mamba1/transduction_model/model.pt',
+                    '模型檔案路徑')
 flags.DEFINE_string('streaming_output',
                     'output/streaming_output.wav',
                     '串流輸出 WAV 路徑')
-flags.DEFINE_boolean('realtime', False,
+flags.DEFINE_boolean('realtime', True,
                      '是否模擬真實取樣速率延遲')
 flags.DEFINE_boolean('compare_batch', True,
                      '是否同時執行批次推論做比較')
-flags.DEFINE_string('play_mode', 'paplay',
+flags.DEFINE_string('play_mode', 'realtime',
                     '播放模式: realtime (即時 pacat), paplay (推論完再播), none (不播)')
 flags.DEFINE_boolean('save_wav', True,
                      '是否儲存 WAV 檔案')
 flags.DEFINE_boolean('save_chunks', False,
                      '是否儲存每段 vocoder 輸出為個別 WAV')
-
-try:
-    flags.DEFINE_boolean('quantized', False, '是否使用 INT16 量化模型')
-except flags.DuplicateFlagError:
-    pass
+flags.DEFINE_boolean('use_cpp', True,
+                     '使用 C++ 推論引擎 (不用 PyTorch model)')
+flags.DEFINE_string('weights_dir', 'exported_weights',
+                    'C++ 引擎的匯出權重目錄')
+flags.DEFINE_boolean('use_int8', False,
+                     '使用 INT8 量化模型 (qat_model_int8.pt)')
+flags.DEFINE_string('int8_model_path',
+                    'output_qat_int8/qat_model_int8.pt',
+                    'INT8 量化模型檔案路徑')
 
 
 def run_batch_inference(model, datapoint, device, audio_normalizer, vocoder):
@@ -93,6 +94,135 @@ def run_batch_inference(model, datapoint, device, audio_normalizer, vocoder):
         y = audio_normalizer.inverse(y.cpu()).to(device)
         audio = vocoder(y).cpu().numpy()
     return audio
+
+
+def _convert_qat_state_dict(state_dict):
+    """
+    將 QAT checkpoint 的 state_dict key 轉換回原始 architecture.Model 格式。
+
+    QAT 訓練會做兩件事:
+      1. Conv1d 包成 QuantizedConv1d → key 多一層 .conv.
+         Linear 包成 QuantizedLinear → key 多一層 .linear.
+      2. ResBlock 之間插入 ActivationQuantHook → conv_blocks 索引變成 0,2,4 (原本 0,1,2)
+
+    此函數把 QAT key 轉回原始格式, 同時也能透通處理非 QAT 的 checkpoint。
+    """
+    # 快速偵測: 如果沒有任何 QAT 特徵 key, 直接回傳
+    has_qat_keys = any(
+        '.conv.weight' in k or '.conv.bias' in k or
+        '.linear.weight' in k or '.linear.bias' in k
+        for k in state_dict.keys()
+    )
+    if not has_qat_keys:
+        return state_dict
+
+    logging.info('  偵測到 QAT checkpoint, 自動轉換 state_dict keys...')
+
+    # conv_blocks 索引重映射: QAT 插入 ActivationQuantHook 後
+    # 原本 [ResBlock0, ResBlock1, ResBlock2] → [ResBlock0, ActQuant, ResBlock1, ActQuant, ResBlock2, ActQuant]
+    # 即 conv_blocks.{0,2,4} → conv_blocks.{0,1,2}
+    qat_to_orig_idx = {0: 0, 2: 1, 4: 2}
+
+    new_state_dict = {}
+    skipped = 0
+    for key, value in state_dict.items():
+        new_key = key
+
+        # 跳過 ActivationQuantHook 的參數 (它們在原始模型中不存在)
+        # ActivationQuantHook 是 conv_blocks.{1,3,5}
+        if key.startswith('conv_blocks.'):
+            parts = key.split('.')
+            idx = int(parts[1])
+            if idx in (1, 3, 5):
+                skipped += 1
+                continue
+            # 重映射索引
+            if idx in qat_to_orig_idx:
+                parts[1] = str(qat_to_orig_idx[idx])
+                new_key = '.'.join(parts)
+
+        # 去掉 QuantizedConv1d 的 .conv. 包裝
+        new_key = new_key.replace('.conv1.conv.', '.conv1.')
+        new_key = new_key.replace('.conv2.conv.', '.conv2.')
+        new_key = new_key.replace('.residual_path.conv.', '.residual_path.')
+
+        # 去掉 QuantizedLinear 的 .linear. 包裝
+        new_key = new_key.replace('.linear.weight', '.weight')
+        new_key = new_key.replace('.linear.bias', '.bias')
+
+        # 跳過 num_batches_tracked (原始模型不追蹤)
+        if new_key.endswith('.num_batches_tracked'):
+            skipped += 1
+            continue
+
+        new_state_dict[new_key] = value
+
+    logging.info(f'  轉換完成: {len(new_state_dict)} 個 key (跳過 {skipped} 個 QAT 專用 key)')
+    return new_state_dict
+
+
+def _load_int8_quantized_model(int8_path, model, device):
+    """
+    載入 INT8 量化模型 (qat_model_int8.pt) 並反量化為 FP32 載入到 Model。
+
+    INT8 檔案格式 (由 qat_int8.py export_int16_weights 匯出):
+      {
+        'quantized_weights': {name: int8_tensor},
+        'scales':            {name: (scale, zero_point)},
+        'other_params':      {name: fp32_tensor},
+        'bits':              8,
+        'per_channel':       True,
+      }
+
+    反量化公式: weight_fp32 = (int8_weight - zero_point) * scale
+    """
+    logging.info(f'  載入 INT8 量化模型: {int8_path}')
+    ckpt = torch.load(int8_path, map_location=device, weights_only=False)
+
+    quantized_weights = ckpt['quantized_weights']
+    scales = ckpt['scales']
+    other_params = ckpt['other_params']
+    bits = ckpt.get('bits', 8)
+    per_channel = ckpt.get('per_channel', True)
+
+    logging.info(f'  INT8 模型: {len(quantized_weights)} 個量化權重, '
+                 f'{len(other_params)} 個非量化參數, bits={bits}')
+
+    # ── 反量化 INT8 → FP32 ────────────────────────────────────
+    dequantized_state = {}
+    for name, q_tensor in quantized_weights.items():
+        scale, zero_point = scales[name]
+        # reshape scale/zero_point for broadcast
+        shape = [q_tensor.size(0)] + [1] * (q_tensor.dim() - 1)
+        s = scale.view(shape).to(device)
+        zp = zero_point.view(shape).to(device)
+        # 反量化: fp32 = (int8 - zero_point) * scale
+        w_fp32 = (q_tensor.to(device).float() - zp) * s
+        dequantized_state[name] = w_fp32
+
+    # ── 合併為完整 state_dict ─────────────────────────────────
+    full_state_dict = {}
+    full_state_dict.update(dequantized_state)
+    for name, param in other_params.items():
+        full_state_dict[name] = param.to(device)
+
+    # ── QAT key 轉換 (與 FP32 QAT 模型相同的 key 修正) ────────
+    full_state_dict = _convert_qat_state_dict(full_state_dict)
+
+    # ── 載入到模型 ────────────────────────────────────────────
+    model.load_state_dict(full_state_dict)
+    model.eval()
+
+    # ── 統計資訊 ──────────────────────────────────────────────
+    q_size = sum(t.nelement() * 1 for t in quantized_weights.values())
+    o_size = sum(t.nelement() * 4 for t in other_params.values())
+    s_size = sum(s.nelement() * 4 + z.nelement() * 4 for s, z in scales.values())
+    int8_mb = (q_size + o_size + s_size) / 1024 / 1024
+    fp32_mb = sum(p.numel() * 4 for p in model.parameters()) / 1024 / 1024
+    logging.info(f'  INT8 檔案大小: {int8_mb:.1f} MB → 反量化後 FP32: {fp32_mb:.1f} MB')
+    logging.info(f'  ✅ INT8 模型載入完成')
+
+    return model
 
 
 def main():
@@ -157,18 +287,6 @@ def main():
         logging.info(f'樣本 {FLAGS.sample_index}: raw_emg shape={raw_emg.shape}, '
                      f'總幀數={len(raw_emg)//8}')
 
-    # ── 載入模型 ──────────────────────────────────────────────
-    logging.info(f'載入模型: {FLAGS.model_path}')
-    n_phones = len(phoneme_inventory)
-    model = Model(devset.num_features, devset.num_speech_features,
-                  n_phones).to(device)
-    if FLAGS.quantized:
-        load_quantized_model(model, FLAGS.model_path, device)
-    else:
-        state_dict = torch.load(FLAGS.model_path, map_location=device)
-        model.load_state_dict(state_dict)
-    model.eval()
-
     # ── 載入 Vocoder ──────────────────────────────────────────
     logging.info('載入 HiFi-GAN vocoder...')
     vocoder = Vocoder(device=device)
@@ -188,20 +306,68 @@ def main():
     chunk_dir = None
     if FLAGS.save_chunks:
         chunk_dir = os.path.join(out_dir, 'chunks')
-        logging.info(f' 每段音訊將存到: {chunk_dir}/')
+        logging.info(f'📂 每段音訊將存到: {chunk_dir}/')
 
-    pipeline = StreamingPipeline(
-        model=model,
-        streaming_vocoder=streaming_vocoder,
-        audio_normalizer=devset.mfcc_norm,
-        device=device,
-        vocoder_chunk_size=FLAGS.vocoder_chunk_size,
-        play_mode=FLAGS.play_mode,
-        chunk_output_dir=chunk_dir,
-    )
+    if FLAGS.use_cpp:
+        # ── C++ 推論引擎 ──────────────────────────────────────
+        logging.info(f'載入 C++ 推論引擎: {FLAGS.weights_dir}')
+        from cpp_forward import CppInferenceEngine
+        cpp_engine = CppInferenceEngine()
+        cpp_engine.load_weights(FLAGS.weights_dir)
+
+        pipeline = CppStreamingPipeline(
+            cpp_engine=cpp_engine,
+            streaming_vocoder=streaming_vocoder,
+            audio_normalizer=devset.mfcc_norm,
+            device=device,
+            vocoder_chunk_size=FLAGS.vocoder_chunk_size,
+            play_mode=FLAGS.play_mode,
+            chunk_output_dir=chunk_dir,
+        )
+        engine_label = 'C++ Engine'
+    else:
+        # ── PyTorch 模型 ──────────────────────────────────────
+        n_phones = len(phoneme_inventory)
+        model = Model(devset.num_features, devset.num_speech_features,
+                      n_phones).to(device)
+
+        if FLAGS.use_int8:
+            # ── INT8 量化模型 ─────────────────────────────────
+            logging.info(f'載入 INT8 量化模型: {FLAGS.int8_model_path}')
+            model = _load_int8_quantized_model(
+                FLAGS.int8_model_path, model, device
+            )
+            engine_label = 'PyTorch Model (INT8 QAT)'
+        else:
+            # ── 標準 FP32 / QAT FP32 模型 ────────────────────
+            logging.info(f'載入模型: {FLAGS.model_path}')
+            state_dict = torch.load(FLAGS.model_path, map_location=device)
+            state_dict = _convert_qat_state_dict(state_dict)
+            model.load_state_dict(state_dict)
+            model.eval()
+            engine_label = 'PyTorch Model'
+
+        pipeline = StreamingPipeline(
+            model=model,
+            streaming_vocoder=streaming_vocoder,
+            audio_normalizer=devset.mfcc_norm,
+            device=device,
+            vocoder_chunk_size=FLAGS.vocoder_chunk_size,
+            play_mode=FLAGS.play_mode,
+            chunk_output_dir=chunk_dir,
+        )
 
     # ── 啟動 Pipeline ─────────────────────────────────────
-
+    logging.info('=' * 60)
+    logging.info(f' 啟動多執行緒即時 EMG → 語音 Pipeline ({engine_label})')
+    logging.info('  Thread 1: EMG 擷取')
+    logging.info('  Thread 2: 前處理')
+    if FLAGS.use_cpp:
+        logging.info('  Thread 3: 推論 (C++ CNN+Mamba → Vocoder)')
+    else:
+        logging.info('  Thread 3: 推論 (因果 CNN → Stateful Mamba → Vocoder)')
+    logging.info(f'  播放模式: {FLAGS.play_mode}')
+    logging.info('=' * 60)
 
     start_time = time.time()
 
@@ -222,16 +388,22 @@ def main():
         else:
             infer_time = total_time
 
+        logging.info('=' * 60)
+        logging.info(f'   推論時間:   {infer_time:.2f}s')
+        logging.info(f'   總時間:     {total_time:.2f}s (含播放)')
+        logging.info(f'   音訊長度:   {audio_dur:.2f}s')
+        logging.info(f'   推論 RTF:   {infer_time / audio_dur:.3f}x')
 
         if FLAGS.save_wav:
             sf.write(FLAGS.streaming_output, full_audio, AUDIO_SR)
+            logging.info(f'✅ WAV 已儲存: {FLAGS.streaming_output}')
         logging.info('=' * 60)
     else:
         logging.warning(' 未產生任何音訊')
         return
 
-    # ── (可選) 批次推論比較 ───────────────────────────────────
-    if FLAGS.compare_batch and sample is None:
+    # ── (可選) 批次推論比較 (僅 PyTorch 模式) ─────────────────
+    if FLAGS.compare_batch and sample is not None and not FLAGS.use_cpp:
         logging.info('執行批次推論進行比較...')
         batch_audio = run_batch_inference(
             model, sample, device, devset.mfcc_norm, vocoder
