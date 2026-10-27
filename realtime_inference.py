@@ -27,6 +27,9 @@
 import os
 import sys
 import time
+import glob
+import queue
+import threading
 import numpy as np
 import logging
 
@@ -35,16 +38,42 @@ import soundfile as sf
 
 from architecture import Model
 from data_utils import phoneme_inventory
-from vocoder import Vocoder, StreamingVocoder
+from vocoder import Vocoder, ONNXVocoder, StreamingVocoder, StreamingONNXVocoder
 from emg_simulator import EMGSimulator
 from read_emg import EMGDataset
-from streaming_pipeline import StreamingPipeline, AUDIO_SR
+from streaming_pipeline import StreamingPipeline, get_audio_sr
 from cpp_streaming_pipeline import CppStreamingPipeline
+
+try:
+    from channel_quality import ChannelQualityAnalyzer, ChannelStatus
+    HAS_CHANNEL_QUALITY = True
+except ImportError:
+    HAS_CHANNEL_QUALITY = False
+
+try:
+    import sounddevice as sd
+    HAS_SOUNDDEVICE = True
+except ImportError:
+    HAS_SOUNDDEVICE = False
+
+try:
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
+        QPushButton, QLabel, QProgressBar, QFrame
+    )
+    from PySide6.QtCore import QThread, Signal, Slot, Qt, QRect
+    from PySide6.QtGui import QPainter, QColor, QFont, QPen
+    import pyqtgraph as pg
+    HAS_PYSIDE6 = True
+except ImportError:
+    HAS_PYSIDE6 = False
 
 from absl import flags
 FLAGS = flags.FLAGS
 
 # ── 串流推論專用參數 ─────────────────────────────────────────
+flags.DEFINE_boolean('gui', False,
+                     '是否啟動 PySide6 GUI 視覺化介面 (預設開啟)')
 flags.DEFINE_integer('vocoder_chunk_size', 30,
                      '每次送入 vocoder 的 mel 幀數 (越大越穩定，但延遲越高)')
 flags.DEFINE_integer('emg_chunk_frames', 10,
@@ -53,6 +82,8 @@ flags.DEFINE_integer('sample_index', 0,
                      '使用資料集中第幾個樣本')
 flags.DEFINE_string('emg_file', None,
                     '自訂 EMG 檔案路徑 (.npy, shape=(T,8)). 設定後忽略 sample_index')
+flags.DEFINE_string('emg_info', None,   
+                    '自訂 EMG info JSON 路徑. 控制前處理參數 (already_preprocessed, emg_scale, notch_freq 等)')
 flags.DEFINE_boolean('list_samples', False,
                      '列出資料集中所有可用樣本後結束')
 flags.DEFINE_string('model_path',
@@ -71,7 +102,7 @@ flags.DEFINE_boolean('save_wav', True,
                      '是否儲存 WAV 檔案')
 flags.DEFINE_boolean('save_chunks', False,
                      '是否儲存每段 vocoder 輸出為個別 WAV')
-flags.DEFINE_boolean('use_cpp', True,
+flags.DEFINE_boolean('use_cpp', False,
                      '使用 C++ 推論引擎 (不用 PyTorch model)')
 flags.DEFINE_string('weights_dir', 'exported_weights',
                     'C++ 引擎的匯出權重目錄')
@@ -80,6 +111,798 @@ flags.DEFINE_boolean('use_int8', False,
 flags.DEFINE_string('int8_model_path',
                     'output_qat_int8/qat_model_int8.pt',
                     'INT8 量化模型檔案路徑')
+
+
+# ── 共用 EMG 前處理函式 ───────────────────────────────────────
+def _preprocess_emg(raw_emg, emg_path=None):
+    """
+    根據 info JSON 決定前處理流程，與 read_emg.py __getitem__ 邏輯一致。
+
+    JSON 查找順序：
+      1. --emg_info 指定的檔案
+      2. emg_path 旁邊的 *_info.json（自動推斷）
+
+    支援的 JSON 欄位（皆選填）：
+      already_preprocessed : bool   (預設 true)
+      emg_scale            : float  (預設 0.35)
+      raw_sampling_rate    : float  (預設 689.06)
+      target_sampling_rate : float  (預設 689.06)
+      notch_freq           : float  (預設 60)
+    """
+    import json as _json
+    from read_emg import apply_to_all, notch_harmonics, remove_drift, subsample
+
+    # 預設值
+    already_preprocessed = True
+    emg_scale = 0.35
+    raw_sr = 689.06
+    target_sr = 689.06
+    notch_freq = 60
+
+    # 1) 優先使用 --emg_info 指定的 JSON
+    info_path = getattr(FLAGS, 'emg_info', None)
+
+    # 2) 若沒指定，嘗試從 emg_path 自動推斷
+    if not info_path and emg_path:
+        emg_base = os.path.splitext(emg_path)[0]
+        if emg_base.endswith('_emg'):
+            info_path = emg_base[:-4] + '_info.json'
+        elif emg_base.endswith('_inference_689hz'):
+            info_path = emg_base[:-len('_inference_689hz')] + '_info.json'
+
+    # 讀取 JSON
+    if info_path and os.path.exists(info_path):
+        with open(info_path) as f:
+            file_info = _json.load(f)
+        already_preprocessed = file_info.get('already_preprocessed', already_preprocessed)
+        emg_scale = file_info.get('emg_scale', emg_scale)
+        raw_sr = file_info.get('raw_sampling_rate', raw_sr)
+        target_sr = file_info.get('target_sampling_rate', target_sr)
+        notch_freq = file_info.get('notch_freq', notch_freq)
+        if 'already_preprocessed' not in file_info:
+            already_preprocessed = (abs(raw_sr - target_sr) < 5)
+        logging.info(f'EMG info JSON: {info_path}')
+
+    logging.info(f'EMG preprocessing: already_preprocessed={already_preprocessed}, '
+                 f'emg_scale={emg_scale}, raw_sr={raw_sr}, notch_freq={notch_freq}')
+
+    if already_preprocessed:
+        raw_emg = raw_emg * emg_scale
+    else:
+        raw_emg = apply_to_all(notch_harmonics, raw_emg, notch_freq, raw_sr)
+        raw_emg = apply_to_all(remove_drift, raw_emg, raw_sr)
+        if abs(raw_sr - target_sr) > 1:
+            raw_emg = apply_to_all(subsample, raw_emg, target_sr, raw_sr)
+
+    for c in getattr(FLAGS, 'remove_channels', []):
+        raw_emg[:, int(c)] = 0
+    raw_emg = raw_emg.astype(np.float32)
+    raw_emg = raw_emg / 20.0
+    raw_emg = 50.0 * np.tanh(raw_emg / 50.0)
+    return raw_emg
+
+
+# ── PySide6 GUI 模組 ──────────────────────────────────────────
+if HAS_PYSIDE6:
+    class SignalBarsWidget(QWidget):
+        """手機信號強度風格的 EMG 通道品質指示器 (4 根由小到大的長條)"""
+        COLOR_4BARS = QColor(76, 175, 80)       # 亮綠色 — 優秀
+        COLOR_3BARS = QColor(139, 195, 74)      # 淺綠色 — 良好
+        COLOR_2BARS = QColor(255, 193, 7)       # 琥珀黃 — 普通
+        COLOR_1BAR  = QColor(255, 87, 34)       # 深橘紅 — 差
+        COLOR_0BARS = QColor(244, 67, 54)       # 紅色   — 極差
+        COLOR_GRAY  = QColor(100, 100, 100)     # 灰色   — 未校準
+        COLOR_INACTIVE = QColor(50, 50, 50)     # 暗底
+        COLOR_BORDER   = QColor(70, 70, 70)     # 邊框
+
+        _BAR_COLORS = {4: COLOR_4BARS, 3: COLOR_3BARS, 2: COLOR_2BARS,
+                       1: COLOR_1BAR,  0: COLOR_0BARS}
+
+        def __init__(self, channel_id, parent=None):
+            super().__init__(parent)
+            self.channel_id = channel_id
+            self._bars = 0
+            self._calibrated = True
+            self.setToolTip('Channel quality')
+            self.setFixedSize(58, 58)
+
+        def set_status(self, status):
+            if hasattr(status, 'quality') and status.quality == 'uncalibrated':
+                self._bars = 0
+                self._calibrated = False
+            else:
+                self._bars = getattr(status, 'bars', 0)
+                self._calibrated = True
+            self.setToolTip(getattr(status, 'detail', ''))
+            self.update()
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            w, h = self.width(), self.height()
+            label_h = 14
+            pad = 3
+            bar_h_max = h - label_h - pad * 2
+            bar_area_w = w - pad * 2
+            n = 4
+            gap = 3
+            bar_w = max(6, (bar_area_w - (n - 1) * gap) // n)
+            total_w = n * bar_w + (n - 1) * gap
+            x0 = pad + (bar_area_w - total_w) // 2
+
+            color = (self._BAR_COLORS.get(self._bars, self.COLOR_0BARS)
+                     if self._calibrated else self.COLOR_GRAY)
+
+            for i in range(n):
+                frac = (i + 1) / n
+                bh = int(bar_h_max * frac)
+                x = x0 + i * (bar_w + gap)
+                y = pad + bar_h_max - bh
+
+                if not self._calibrated:
+                    painter.setPen(QPen(self.COLOR_GRAY, 1))
+                    painter.setBrush(QColor(40, 40, 40))
+                elif i < self._bars:
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(color)
+                else:
+                    painter.setPen(QPen(self.COLOR_BORDER, 1))
+                    painter.setBrush(self.COLOR_INACTIVE)
+
+                painter.drawRoundedRect(x, y, bar_w, bh, 2, 2)
+
+            painter.setPen(QColor(180, 180, 180))
+            font = painter.font()
+            font.setPointSize(8)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(QRect(0, h - label_h, w, label_h),
+                             Qt.AlignCenter, f'Ch{self.channel_id + 1}')
+            painter.end()
+
+    class FilePlaybackWorker(QThread):
+        update_plot_signal = Signal(np.ndarray)
+        file_changed_signal = Signal(str, int, int)
+        status_signal = Signal(str)
+
+        def __init__(self, search_root="emg_data", data_queue=None, crossfade_ms=200):
+            super().__init__()
+            self.search_root = FLAGS.emg_file or search_root
+            self.data_queue = data_queue
+            self.fps_delay = 50 
+            self.ui_batch_size = 34
+            self.inference_batch_size = 138 
+            self.crossfade_samples = int(689.06 * crossfade_ms / 1000)
+            
+            self.is_running = True
+            self.is_recording = False  
+            self.inference_buffer = []
+            
+            self.file_list = []
+            self.file_idx = 0
+            self.data = None
+            self.current_idx = 0
+            self.data_length = 0
+
+        def _scan_emg_files(self, root_dir):
+            if os.path.isfile(root_dir):
+                return [root_dir]
+            matches = []
+            if os.path.exists(root_dir):
+                for dirpath, dirnames, filenames in os.walk(root_dir):
+                    for fname in sorted(filenames):
+                        if fname.endswith('.npy') and 'emg' in fname.lower():
+                            matches.append(os.path.join(dirpath, fname))
+            matches.sort()
+            return matches
+
+        def _load_and_preprocess_data(self, path):
+            if path.endswith('.npy'):
+                x = np.load(path)
+                if x.ndim == 1:
+                    x = x.reshape(-1, 8)
+                if x.shape[0] == 8 and x.shape[1] > 8:
+                    x = x.T
+            else:
+                x = np.loadtxt(path, delimiter=',', skiprows=1)
+
+            x = _preprocess_emg(x, path)
+            return x.T
+
+        def _load_current_file(self):
+            if not self.file_list:
+                return
+            path = self.file_list[self.file_idx]
+            self.data = self._load_and_preprocess_data(path)
+            self.current_idx = 0
+            self.data_length = self.data.shape[1]
+            self.file_changed_signal.emit(
+                os.path.basename(path), self.file_idx + 1, len(self.file_list))
+
+        def _apply_crossfade(self, outgoing_tail, incoming_head):
+            n = min(outgoing_tail.shape[1], incoming_head.shape[1])
+            if n == 0:
+                return incoming_head
+            fade_out = np.linspace(1.0, 0.0, n).reshape(1, -1)
+            fade_in  = np.linspace(0.0, 1.0, n).reshape(1, -1)
+            blended = outgoing_tail[:, :n] * fade_out + incoming_head[:, :n] * fade_in
+            return blended
+
+        def _advance_to_next_file(self):
+            if len(self.file_list) <= 1:
+                self.current_idx = 0
+                return None
+            cf_len = min(self.crossfade_samples, self.data_length)
+            outgoing_tail = self.data[:, -cf_len:] if cf_len > 0 else None
+            self.file_idx = (self.file_idx + 1) % len(self.file_list)
+            self._load_current_file()
+            if outgoing_tail is not None and self.data_length > 0:
+                cf_len = min(cf_len, self.data_length)
+                incoming_head = self.data[:, :cf_len]
+                crossfaded = self._apply_crossfade(outgoing_tail, incoming_head)
+                self.current_idx = cf_len
+                return crossfaded
+            return None
+
+        def run(self):
+            self.status_signal.emit("Status: Scanning EMG files...")
+            self.file_list = self._scan_emg_files(self.search_root)
+            if self.file_list:
+                self._load_current_file()
+                self.status_signal.emit(f"Status: Loaded {len(self.file_list)} files.")
+            else:
+                self.status_signal.emit("Status: No EMG files found, using standby noise.")
+
+            self.was_recording = False
+            crossfade_remainder = None
+            cf_offset = 0
+
+            while self.is_running:
+                if self.is_recording:
+                    if not self.file_list or self.data_length == 0:
+                        batch_data = np.zeros((8, self.ui_batch_size))
+                    elif crossfade_remainder is not None:
+                        cf_remaining = crossfade_remainder.shape[1] - cf_offset
+                        n = min(self.ui_batch_size, cf_remaining)
+                        batch_data = crossfade_remainder[:, cf_offset:cf_offset + n]
+                        cf_offset += n
+                        if cf_offset >= crossfade_remainder.shape[1]:
+                            crossfade_remainder = None
+                            cf_offset = 0
+                    else:
+                        end_idx = self.current_idx + self.ui_batch_size
+                        if end_idx <= self.data_length:
+                            batch_data = self.data[:, self.current_idx:end_idx]
+                            self.current_idx = end_idx
+                        else:
+                            remaining = self.data[:, self.current_idx:]
+                            cf_data = self._advance_to_next_file()
+                            if cf_data is not None:
+                                crossfade_remainder = cf_data
+                                cf_offset = 0
+                            batch_data = remaining if remaining.shape[1] > 0 else np.zeros((8, self.ui_batch_size))
+
+                    self.inference_buffer.append(batch_data)
+                    current_len = sum(b.shape[1] for b in self.inference_buffer)
+                    if current_len >= self.inference_batch_size:
+                        combined_data = np.concatenate(self.inference_buffer, axis=1)
+                        if self.data_queue.qsize() > 1:
+                            try:
+                                self.data_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                        self.data_queue.put(combined_data)
+                        self.inference_buffer = []
+                    self.was_recording = True
+                else:
+                    batch_data = np.random.randn(8, self.ui_batch_size) * 0.15
+                    if getattr(self, 'was_recording', False):
+                        while not self.data_queue.empty():
+                            try:
+                                self.data_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        self.data_queue.put(np.zeros((8, self.inference_batch_size)))
+                        self.inference_buffer = []
+                        crossfade_remainder = None
+                        cf_offset = 0
+                        self.was_recording = False
+
+                self.update_plot_signal.emit(batch_data)
+                self.msleep(self.fps_delay)
+
+        @Slot(bool)
+        def set_recording(self, state):
+            self.is_recording = state
+
+        def stop(self):
+            self.is_running = False
+
+    class InferenceWorker(QThread):
+        result_signal = Signal(str, float)
+        mel_signal = Signal(np.ndarray)
+        audio_signal = Signal(np.ndarray)
+
+        def __init__(self, data_queue, weight_path=None):
+            super().__init__()
+            self.data_queue = data_queue
+            self.weight_path = weight_path or FLAGS.model_path
+            self.is_running = True
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model = None
+            self.cpp_engine = None
+            self.streaming_vocoder = None
+            self.streaming_state = None
+            self.mfcc_norm = None
+
+        def run(self):
+            self.result_signal.emit("Status: Loading AI Models...", 0.0)
+            
+            if os.path.exists('normalizers.pkl'):
+                try:
+                    import pickle
+                    self.mfcc_norm, _ = pickle.load(open('normalizers.pkl', 'rb'))
+                except Exception as e:
+                    logging.warning(f"Failed to load normalizers.pkl: {e}")
+
+            try:
+                if FLAGS.use_cpp:
+                    try:
+                        from cpp_forward import CppInferenceEngine
+                        self.cpp_engine = CppInferenceEngine()
+                        self.cpp_engine.load_weights(FLAGS.weights_dir)
+                        logging.info(f"Loaded C++ Engine from {FLAGS.weights_dir}")
+                    except Exception as e:
+                        logging.warning(f"C++ Engine unavailable ({e}), falling back to PyTorch Model...")
+                        self.cpp_engine = None
+
+                if self.cpp_engine is None:
+                    n_phones = len(phoneme_inventory)
+                    self.model = Model(8, 80, n_phones).to(self.device)
+
+                    candidate_paths = [
+                        self.weight_path,
+                        'transduction_model.pt',
+                        'models_mamba1/transduction_model/model.pt',
+                        'models/transduction_model/model.pt',
+                        'model.pt'
+                    ]
+                    actual_path = None
+                    for p in candidate_paths:
+                        if p and os.path.exists(p):
+                            actual_path = p
+                            break
+
+                    if FLAGS.use_int8 and os.path.exists(FLAGS.int8_model_path):
+                        self.model = _load_int8_quantized_model(FLAGS.int8_model_path, self.model, self.device)
+                    elif actual_path:
+                        checkpoint = torch.load(actual_path, map_location=self.device)
+                        checkpoint = _convert_qat_state_dict(checkpoint)
+                        self.model.load_state_dict(checkpoint, strict=False)
+                        self.model.eval()
+                        logging.info(f"Loaded PyTorch Model from {actual_path}")
+                    else:
+                        logging.warning(f"Model checkpoint not found in candidate paths: {candidate_paths}")
+
+                    if hasattr(self.model, 'init_streaming_state'):
+                        try:
+                            self.streaming_state = self.model.init_streaming_state(self.device)
+                        except Exception as e:
+                            logging.warning(f"Could not init streaming state: {e}")
+                            self.streaming_state = None
+            except Exception as e:
+                err_text = f"Model init error: {e}"
+                logging.error(err_text)
+                self.result_signal.emit(err_text, 0.0)
+
+            try:
+                vocoder_mode = getattr(FLAGS, 'vocoder_mode', 'mel')
+                if vocoder_mode == 'lpcnet':
+                    base_vocoder = FARGANVocoder(device=str(self.device))
+                    self.streaming_vocoder = StreamingFARGANVocoder(base_vocoder)
+                    logging.info("FARGAN Streaming Vocoder loaded successfully!")
+                elif FLAGS.vocoder_onnx:
+                    base_vocoder = ONNXVocoder(
+                        onnx_path=FLAGS.vocoder_onnx,
+                        device=str(self.device)
+                    )
+                    self.streaming_vocoder = StreamingONNXVocoder(base_vocoder)
+                    logging.info("ONNX Pruned+QAT Streaming Vocoder loaded successfully!")
+                else:
+                    base_vocoder = Vocoder(device=str(self.device))
+                    self.streaming_vocoder = StreamingVocoder(base_vocoder)
+                    logging.info("HiFi-GAN Streaming Vocoder loaded successfully!")
+            except Exception as e:
+                logging.error(f"Vocoder error: {e}")
+
+            self.result_signal.emit("Status: Waiting for input...", 0.0)
+
+            while self.is_running:
+                try:
+                    emg_data = self.data_queue.get(timeout=0.1)
+                    start_time = time.time()
+                    
+                    if np.all(emg_data == 0):
+                        mel_features = np.zeros((emg_data.shape[1], 80))
+                        self.mel_signal.emit(mel_features)
+                        
+                        if self.streaming_vocoder is not None:
+                            tail_audio = self.streaming_vocoder.flush()
+                            if len(tail_audio) > 0:
+                                self.audio_signal.emit(tail_audio)
+                            self.audio_signal.emit(np.zeros(2000))
+
+                        if self.model is not None and hasattr(self.model, 'init_streaming_state'):
+                            try:
+                                self.streaming_state = self.model.init_streaming_state(self.device)
+                            except Exception:
+                                pass
+                        continue
+
+                    input_tensor = torch.from_numpy(emg_data.T).float().unsqueeze(0).to(self.device)
+                    
+                    pred = None
+                    with torch.no_grad():
+                        if self.cpp_engine is not None:
+                            chunk_len = emg_data.shape[1]
+                            flat_emg = emg_data.T.flatten().tolist()
+                            mel_list = self.cpp_engine.forward_streaming(flat_emg, chunk_len)
+                            mel_tensor = torch.tensor(mel_list, dtype=torch.float32).unsqueeze(0)
+                            pred = mel_tensor
+                        elif self.model is not None:
+                            if hasattr(self.model, 'forward_streaming') and self.streaming_state is not None:
+                                mel, aux, self.streaming_state = self.model.forward_streaming(input_tensor, self.streaming_state)
+                                pred = (mel, aux) if aux is not None else mel
+                            else:
+                                session_ids = torch.zeros((1,), dtype=torch.long).to(self.device)
+                                pred = self.model(None, input_tensor, session_ids)
+                    
+                    latency = time.time() - start_time
+                    
+                    if pred is not None:
+                        if isinstance(pred, tuple):
+                            mel_tensor = pred[0].detach().cpu()
+                            phoneme_pred = pred[1] if len(pred) > 1 else None
+                            mel_features = mel_tensor.squeeze(0).numpy() if mel_tensor.dim() == 3 else mel_tensor.numpy()
+                        else:
+                            mel_tensor = pred.detach().cpu()
+                            phoneme_pred = None
+                            mel_features = mel_tensor.squeeze(0).numpy() if mel_tensor.dim() == 3 else mel_tensor.numpy()
+                        
+                        if phoneme_pred is not None:
+                            phone_ids = phoneme_pred.argmax(-1).squeeze(0).tolist() if phoneme_pred.dim() >= 2 else phoneme_pred.tolist()
+                            if isinstance(phone_ids, int): phone_ids = [phone_ids]
+                            text_result = f"Predicted Phonemes Length: {len(phone_ids)}"
+                        else:
+                            text_result = f"Feature Shape: {pred[0].shape if isinstance(pred, tuple) else pred.shape}"
+                        
+                        self.result_signal.emit(text_result, latency)
+                        self.mel_signal.emit(mel_features)
+
+                        if self.streaming_vocoder is not None:
+                            mel_chunk = mel_tensor.squeeze(0)
+                            if self.mfcc_norm is not None:
+                                if isinstance(mel_chunk, torch.Tensor):
+                                    mel_np = mel_chunk.detach().cpu().numpy()
+                                    mel_np = self.mfcc_norm.inverse(mel_np)
+                                    mel_chunk = torch.from_numpy(mel_np).float()
+                                else:
+                                    mel_chunk = self.mfcc_norm.inverse(mel_chunk)
+                            mel_chunk = mel_chunk.to(self.device)
+                            audio_chunk = self.streaming_vocoder.synthesize_chunk(mel_chunk)
+                            if len(audio_chunk) > 0:
+                                self.audio_signal.emit(audio_chunk)
+
+                except queue.Empty:
+                    self.msleep(10)
+                    continue
+                except Exception as e:
+                    err_msg = f"Inference Error: {e}"
+                    logging.error(err_msg)
+                    self.result_signal.emit(err_msg, 0.0)
+                    self.msleep(50)
+
+        def stop(self):
+            self.is_running = False
+
+    class MainWindow(QMainWindow):
+        recording_signal = Signal(bool)
+
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("8-Channel EMG & Audio System (Realtime Inference)")
+            self.resize(1400, 750)
+            self.setStyleSheet("background-color: #2b2b2b;")
+
+            main_layout = QVBoxLayout()
+            plot_layout = QHBoxLayout()
+
+            # --- 左側：EMG 波形圖 ---
+            self.plot_widget = pg.PlotWidget(title="Real-time 8-Channel EMG")
+            self.plot_widget.enableAutoRange(axis='y') 
+            self.plot_widget.setDownsampling(mode='peak', auto=True)
+            self.plot_widget.setClipToView(True)
+            plot_layout.addWidget(self.plot_widget, stretch=1)
+
+            self.legend = pg.LegendItem()
+            self.plot_widget.getPlotItem().layout.addItem(self.legend, 1, 2)
+
+            colors = [(255, 100, 100), (100, 255, 100), (100, 100, 255), (255, 255, 100),
+                      (255, 100, 255), (100, 255, 255), (255, 150, 50),  (200, 200, 200)]
+
+            self.curves = []
+            for i in range(8):
+                curve = self.plot_widget.plot(pen=pg.mkPen(color=colors[i], width=1.5))
+                self.curves.append(curve)
+
+            for i in range(7, -1, -1):
+                self.legend.addItem(self.curves[i], f"Ch {i+1}")
+
+            # --- 右側：模型輸出 (上下分割) ---
+            right_layout = QVBoxLayout()
+
+            # 上半部：梅爾頻譜圖
+            self.mel_widget = pg.PlotWidget(title="Mel-Spectrogram")
+            self.mel_image = pg.ImageItem()
+            self.mel_widget.addItem(self.mel_image)
+            self.mel_image.setColorMap(pg.colormap.get('viridis'))
+            self.mel_image.setLevels([0, 5]) 
+            right_layout.addWidget(self.mel_widget, stretch=1)
+
+            # 下半部：音訊波形圖
+            self.audio_widget = pg.PlotWidget(title="Vocoder Output")
+            self.audio_widget.setYRange(-1.0, 1.0) 
+            self.audio_widget.setDownsampling(mode='peak', auto=True)
+            self.audio_widget.setClipToView(True)
+            self.audio_curve = self.audio_widget.plot(pen=pg.mkPen(color=(0, 255, 255), width=1.5))
+            right_layout.addWidget(self.audio_widget, stretch=1)
+
+            plot_layout.addLayout(right_layout, stretch=1)
+            main_layout.addLayout(plot_layout)
+
+            # --- 通道品質指示面板 (手機信號風格) ---
+            self.quality_analyzer = ChannelQualityAnalyzer(
+                num_channels=8, sample_rate=689.06, calibration_duration=3.0
+            ) if HAS_CHANNEL_QUALITY else None
+
+            quality_frame = QFrame()
+            quality_frame.setStyleSheet(
+                "QFrame { background-color: #333333; border: 1px solid #555555;"
+                " border-radius: 6px; padding: 4px; }"
+            )
+            quality_layout = QHBoxLayout(quality_frame)
+            quality_layout.setContentsMargins(10, 6, 10, 6)
+            quality_title = QLabel("Channel Quality:")
+            quality_title.setStyleSheet("color: #aaaaaa; font-size: 13px; border: none;")
+            quality_layout.addWidget(quality_title)
+            quality_layout.addStretch(1)
+
+            self.signal_bars = []
+            for i in range(8):
+                bar_widget = SignalBarsWidget(i)
+                self.signal_bars.append(bar_widget)
+                quality_layout.addWidget(bar_widget)
+            quality_layout.addStretch(1)
+            main_layout.addWidget(quality_frame)
+
+
+
+            # --- 按鈕與文字區塊 ---
+            self.btn_ptt = QPushButton("Click to Start Capture")
+            self.btn_ptt.setStyleSheet(
+                "background-color: #5cb85c; color: white;"
+                " font-size: 18px; padding: 15px;"
+            )
+            self.btn_ptt.clicked.connect(self.toggle_recording)
+
+            main_layout.addWidget(self.btn_ptt)
+            
+            self.app_state = 'ready'  # ready | recording
+            self.is_recording = False
+            self.label_result = QLabel("System Ready. Click to start capture.")
+            self.label_result.setStyleSheet("font-size: 24px; color: #ffffff;")
+            main_layout.addWidget(self.label_result)
+
+            container = QWidget()
+            container.setLayout(main_layout)
+            self.setCentralWidget(container)
+
+            # 緩衝區設定
+            self.buffer_size = 2000
+            self.plot_data = np.zeros((8, self.buffer_size))
+            
+            self.mel_buffer_size = 500
+            self.mel_data = np.zeros((self.mel_buffer_size, 80))
+
+            self.audio_buffer_size = 33000 
+            self.audio_data = np.zeros(self.audio_buffer_size)
+            
+            self.inference_queue = queue.Queue()
+
+            # ── 音訊播放設定 (sounddevice) ──
+            self.audio_sr = get_audio_sr()
+            self._audio_playback_buf = np.zeros(0, dtype=np.float32)
+            self._audio_lock = threading.Lock()
+            self.audio_stream = None
+            if HAS_SOUNDDEVICE:
+                try:
+                    self.audio_stream = sd.OutputStream(
+                        samplerate=self.audio_sr,
+                        channels=1,
+                        dtype='float32',
+                        blocksize=1024,
+                        latency='low',
+                        callback=self._audio_callback,
+                    )
+                    self.audio_stream.start()
+                    logging.info("[音訊] OutputStream 已啟動")
+                except Exception as e:
+                    logging.warning(f"[音訊] 無法開啟音訊裝置: {e}")
+                    self.audio_stream = None
+
+            import shutil, subprocess
+            self.pacat_proc = None
+            if (self.audio_stream is None or not self.audio_stream.active) and shutil.which('pacat') is not None:
+                try:
+                    self.pacat_proc = subprocess.Popen(
+                        ['pacat', '--format=s16le', '--channels=1',
+                         f'--rate={self.audio_sr}', '--raw',
+                         '--stream-name=EMG-to-Speech', '--latency-msec=100'],
+                        stdin=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL
+                    )
+                    logging.info("[音訊] pacat 即時串流 Process 已啟動 (PulseAudio 備援)")
+                except Exception as e:
+                    logging.warning(f"[音訊] pacat 啟動失敗: {e}")
+
+            weight_file_path = FLAGS.model_path
+            self.inference_thread = InferenceWorker(self.inference_queue, weight_file_path)
+            self.inference_thread.result_signal.connect(self.update_result_ui)
+            self.inference_thread.mel_signal.connect(self.update_mel_ui)
+            self.inference_thread.audio_signal.connect(self.update_audio_ui)
+            self.inference_thread.start()
+
+            emg_search_root = FLAGS.emg_file or "emg_data"
+            self.playback_thread = FilePlaybackWorker(
+                emg_search_root, self.inference_queue, crossfade_ms=200
+            )
+            self.playback_thread.update_plot_signal.connect(self.update_plot_ui)
+            self.playback_thread.file_changed_signal.connect(self.update_file_info)
+            self.playback_thread.status_signal.connect(self.update_status_label)
+            self.recording_signal.connect(self.playback_thread.set_recording)
+            self.playback_thread.start()
+
+        def toggle_recording(self, checked=False):
+            self.is_recording = not self.is_recording
+            if self.is_recording:
+                self.app_state = 'recording'
+                self.btn_ptt.setText("Click to Stop Capture")
+                self.btn_ptt.setStyleSheet(
+                    "background-color: #d9534f; color: white;"
+                    " font-size: 18px; padding: 15px;"
+                )
+                self.label_result.setText("Status: Capturing EMG signals...")
+
+                self.recording_signal.emit(True)
+            else:
+                self.app_state = 'ready'
+                self.btn_ptt.setText("Click to Start Capture")
+                self.btn_ptt.setStyleSheet(
+                    "background-color: #5cb85c; color: white;"
+                    " font-size: 18px; padding: 15px;"
+                )
+                self.label_result.setText("Status: Stopped capturing.")
+
+                self.recording_signal.emit(False)
+
+        @Slot(str)
+        def update_status_label(self, msg):
+            self.label_result.setText(msg)
+
+        @Slot(np.ndarray)
+        def update_plot_ui(self, new_data):
+            shift = new_data.shape[1]
+            self.plot_data[:, :-shift] = self.plot_data[:, shift:]
+            self.plot_data[:, -shift:] = new_data
+            
+            for i in range(8):
+                offset = (i - 3.5) * 2
+                self.curves[i].setData(self.plot_data[i] + offset)
+
+            if self.quality_analyzer:
+                statuses = self.quality_analyzer.analyze_chunk(new_data)
+                for st in statuses:
+                    self.signal_bars[st.channel_id].set_status(st)
+
+        @Slot(np.ndarray)
+        def update_mel_ui(self, new_mel):
+            shift = new_mel.shape[0]
+            if shift == 0: return
+            self.mel_data[:-shift, :] = self.mel_data[shift:, :]
+            self.mel_data[-shift:, :] = new_mel
+            self.mel_image.setImage(self.mel_data, autoLevels=False)
+
+        @Slot(np.ndarray)
+        def update_audio_ui(self, new_audio):
+            shift = len(new_audio)
+            if shift == 0: 
+                return
+            
+            new_audio = new_audio.astype(np.float32).copy()
+
+            # ── 區塊邊界平滑過渡 (64 採樣點 / ~3ms Crossfade) ──
+            # 消除 Vocoder 各 chunk 邊界相位的突變跳變與喀噠雜音 (Clicks & Pops)
+            if hasattr(self, '_prev_audio_tail') and self._prev_audio_tail is not None and len(self._prev_audio_tail) > 0:
+                fade_len = min(64, shift, len(self._prev_audio_tail))
+                if fade_len > 0:
+                    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                    fade_in  = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                    new_audio[:fade_len] = (
+                        self._prev_audio_tail[-fade_len:] * fade_out + new_audio[:fade_len] * fade_in
+                    )
+            self._prev_audio_tail = new_audio.copy()
+
+            # 幅度限制與平滑 tanh 軟剪裁，防止數位破音爆音
+            new_audio = np.tanh(new_audio * 1.1)
+
+            if shift >= self.audio_buffer_size:
+                self.audio_data = new_audio[-self.audio_buffer_size:]
+            else:
+                self.audio_data[:-shift] = self.audio_data[shift:]
+                self.audio_data[-shift:] = new_audio
+                
+            visual_data = self.audio_data[::80]
+            self.audio_curve.setData(visual_data)
+
+            if HAS_SOUNDDEVICE and self.audio_stream is not None and self.audio_stream.active:
+                with self._audio_lock:
+                    self._audio_playback_buf = np.concatenate([self._audio_playback_buf, new_audio])
+                    max_buf = self.audio_sr * 2
+                    if len(self._audio_playback_buf) > max_buf:
+                        self._audio_playback_buf = self._audio_playback_buf[-max_buf:]
+            elif getattr(self, 'pacat_proc', None) is not None:
+                try:
+                    pcm_bytes = (new_audio * 32767.0).clip(-32768, 32767).astype(np.int16).tobytes()
+                    self.pacat_proc.stdin.write(pcm_bytes)
+                    self.pacat_proc.stdin.flush()
+                except Exception:
+                    pass
+
+        def _audio_callback(self, outdata, frames, time_info, status):
+            with self._audio_lock:
+                available = len(self._audio_playback_buf)
+                if available >= frames:
+                    outdata[:, 0] = self._audio_playback_buf[:frames]
+                    self._audio_playback_buf = self._audio_playback_buf[frames:]
+                elif available > 0:
+                    outdata[:available, 0] = self._audio_playback_buf
+                    outdata[available:, 0] = 0.0
+                    self._audio_playback_buf = np.zeros(0, dtype=np.float32)
+                else:
+                    outdata[:, 0] = 0.0
+
+        @Slot(str, int, int)
+        def update_file_info(self, filename, current, total):
+            self.setWindowTitle(f"8-Channel EMG & Audio System — [{current}/{total}] {filename}")
+
+        @Slot(str, float)
+        def update_result_ui(self, text, latency):
+            if "Loading" in text or "Waiting" in text:
+                self.label_result.setText(text)
+            else:
+                self.label_result.setText(f"Result: {text} (Latency: {latency:.2f}s)")
+
+
+
+        def closeEvent(self, event):
+            self.playback_thread.stop()
+            self.inference_thread.stop()
+            self.playback_thread.wait()
+            self.inference_thread.wait()
+            if HAS_SOUNDDEVICE and self.audio_stream and self.audio_stream.active:
+                self.audio_stream.stop()
+                self.audio_stream.close()
+            event.accept()
 
 
 def run_batch_inference(model, datapoint, device, audio_normalizer, vocoder):
@@ -92,7 +915,10 @@ def run_batch_inference(model, datapoint, device, audio_normalizer, vocoder):
         pred, _ = model(X, X_raw, sess)
         y = pred.squeeze(0)
         y = audio_normalizer.inverse(y.cpu()).to(device)
-        audio = vocoder(y).cpu().numpy()
+        if isinstance(vocoder, (Vocoder, ONNXVocoder)):
+            audio = vocoder(y).cpu().numpy()
+        else:
+            audio = vocoder(y)  # FARGANVocoder 直接回傳 numpy
     return audio
 
 
@@ -241,7 +1067,19 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logging.info(f'Device: {device}')
 
-    # ── 載入資料集 ────────────────────────────────────────────
+    # ── 啟動 GUI 介面 ──────────────────────────────────────────
+    if FLAGS.gui:
+        if not HAS_PYSIDE6:
+            logging.error("PySide6 或 pyqtgraph 未安裝，無法啟動 GUI 介面！請先安裝: pip install PySide6 pyqtgraph")
+            sys.exit(1)
+
+        logging.info("啟動 PySide6 GUI 視覺化介面...")
+        app = QApplication(sys.argv)
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec())
+
+    # ── 載入資料集 (CLI 模式) ──────────────────────────────────
     logging.info('載入資料集...')
     devset = EMGDataset(dev=True)
 
@@ -260,23 +1098,13 @@ def main():
     # 載入 EMG 資料
     if FLAGS.emg_file:
         logging.info(f'載入自訂 EMG: {FLAGS.emg_file}')
-        # 載入自訂 EMG 並套用與資料集相同的前處理流程
         raw_emg = np.load(FLAGS.emg_file)
         if raw_emg.ndim == 1:
             raw_emg = raw_emg.reshape(-1, 8)
+        if raw_emg.shape[0] == 8 and raw_emg.shape[1] > 8:
+            raw_emg = raw_emg.T
         assert raw_emg.shape[1] == 8, f'EMG 應為 (T, 8), 得到 {raw_emg.shape}'
-        # 前處理：與 load_utterance + __getitem__ 完全一致
-        from read_emg import apply_to_all, notch_harmonics, remove_drift, subsample
-        raw_emg = apply_to_all(notch_harmonics, raw_emg, 60, 1000)
-        raw_emg = apply_to_all(remove_drift, raw_emg, 1000)
-        # raw_emg = emg_orig，只 subsample 到 689.06 Hz（不做 516.79）
-        raw_emg = apply_to_all(subsample, raw_emg, 689.06, 1000)
-        for c in FLAGS.remove_channels:
-            raw_emg[:, int(c)] = 0
-        # 與 __getitem__ 相同的正規化
-        raw_emg = raw_emg.astype(np.float32)
-        raw_emg = raw_emg / 20
-        raw_emg = 50 * np.tanh(raw_emg / 50.)
+        raw_emg = _preprocess_emg(raw_emg, FLAGS.emg_file)
         sample = None
         logging.info(f'自訂 EMG: shape={raw_emg.shape}, '
                      f'總幀數={len(raw_emg)//8}, '
@@ -288,9 +1116,20 @@ def main():
                      f'總幀數={len(raw_emg)//8}')
 
     # ── 載入 Vocoder ──────────────────────────────────────────
-    logging.info('載入 HiFi-GAN vocoder...')
-    vocoder = Vocoder(device=device)
-    streaming_vocoder = StreamingVocoder(vocoder)
+    vocoder_mode = getattr(FLAGS, 'vocoder_mode', 'mel')
+    if vocoder_mode == 'lpcnet':
+        logging.info('載入 FARGAN vocoder...')
+        vocoder = FARGANVocoder(device=device)
+        streaming_vocoder = StreamingFARGANVocoder(vocoder)
+    elif FLAGS.vocoder_onnx:
+        logging.info(f'載入 ONNX Pruned+QAT vocoder: {FLAGS.vocoder_onnx}')
+        vocoder = ONNXVocoder(onnx_path=FLAGS.vocoder_onnx, device=device)
+        streaming_vocoder = StreamingONNXVocoder(vocoder)
+    else:
+        logging.info('載入 HiFi-GAN vocoder...')
+        vocoder = Vocoder(device=device)
+        streaming_vocoder = StreamingVocoder(vocoder)
+    audio_sr = get_audio_sr()
 
     # ── 建立 EMG 模擬器 ──────────────────────────────────────
     simulator = EMGSimulator(
@@ -380,7 +1219,7 @@ def main():
     # ── 結果統計 ──────────────────────────────────────────────
     full_audio = pipeline.get_full_audio()
     if len(full_audio) > 0:
-        audio_dur = len(full_audio) / AUDIO_SR
+        audio_dur = len(full_audio) / get_audio_sr()
         total_time = time.time() - start_time
 
         if pipeline.inference_done_time:
@@ -395,7 +1234,7 @@ def main():
         logging.info(f'   推論 RTF:   {infer_time / audio_dur:.3f}x')
 
         if FLAGS.save_wav:
-            sf.write(FLAGS.streaming_output, full_audio, AUDIO_SR)
+            sf.write(FLAGS.streaming_output, full_audio, get_audio_sr())
             logging.info(f'✅ WAV 已儲存: {FLAGS.streaming_output}')
         logging.info('=' * 60)
     else:
@@ -409,7 +1248,7 @@ def main():
             model, sample, device, devset.mfcc_norm, vocoder
         )
         batch_path = FLAGS.streaming_output.replace('.wav', '_batch.wav')
-        sf.write(batch_path, batch_audio, AUDIO_SR)
+        sf.write(batch_path, batch_audio, get_audio_sr())
 
         min_len = min(len(full_audio), len(batch_audio))
         if min_len > 0:
