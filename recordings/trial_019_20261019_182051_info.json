@@ -1,0 +1,19 @@
+{
+  "text": "silent speech recording trial",
+  "book": "custom_recorded_session",
+  "sentence_index": 19,
+  "raw_sampling_rate": 689.0625,
+  "target_sampling_rate": 689.0625,
+  "num_channels": 8,
+  "num_samples": 12301,
+  "duration_sec": 17.852,
+  "chunks": [
+    [
+      12301,
+      0,
+      0
+    ]
+  ],
+  "audio_file": "trial_019_20261019_182051_audio.wav",
+  "audio_sampling_rate": 22050
+}
