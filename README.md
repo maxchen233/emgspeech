@@ -102,12 +102,11 @@ python recognition_model.py --evaluate_saved "./models/recognition_model/model.p
   - 補齊 `.gitignore`。
   - 清理 `__pycache__` 類型檔案。
 
-- **Add emg_mamba.py, optimize Mamba VRAM, add complete SNN training with BPTT+STDP+SALSA**  
+- **Add emg_mamba.py, optimize Mamba VRAM, add complete SNN training**  
   Commit: `8b75bd4d045dd8540a1ce62af59e082756528c8d`  
   重點：
   - 新增 `emg_mamba.py`。
   - 優化 Mamba 記憶體使用。
-  - 加入結合 **BPTT + STDP + SALSA** 的 SNN 訓練流程。
 
 - **Initial plan**  
   Commit: `b1a166211c541663c905ac07aceaf1d5c23579d0`  
