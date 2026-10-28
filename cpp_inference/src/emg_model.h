@@ -21,7 +21,6 @@ struct MambaWeights {
     Tensor A_log;                 // (d_inner, d_state)
     Tensor D;                     // (d_inner)
     Tensor out_proj_w;            // (d_model, d_inner)
-    Tensor neg_exp_A;             // pre-computed -exp(A_log), (d_inner, d_state)
     int d_model, d_inner, d_state, d_conv, dt_rank;
 };
 
@@ -39,7 +38,6 @@ struct StreamingState {
     // ssm_state[i]:  (d_inner, d_state) — selective scan hidden state
     Tensor mamba_conv_state[4];
     Tensor mamba_ssm_state[4];
-    int conv_pos[4];              // ring buffer write position for mamba conv_state
 };
 
 // ── Full EMG Model ──────────────────────────────────────────────
@@ -78,18 +76,6 @@ private:
     int d_model, num_layers, d_state, d_conv, d_inner, dt_rank;
     int num_outs, num_aux_outs;
 
-    // Pre-allocated workspace for streaming Mamba step (avoids per-timestep malloc)
-    struct MambaStepBuffers {
-        std::vector<float> x_norm;   // (d_model)
-        std::vector<float> xz;      // (2 * d_inner)
-        std::vector<float> x_conv;  // (d_inner)
-        std::vector<float> x_dbc;   // (dt_rank + 2 * d_state)
-        std::vector<float> delta;   // (d_inner)
-        std::vector<float> y;       // (d_inner)
-        std::vector<float> out;     // (d_model)
-    };
-    MambaStepBuffers step_bufs_;
-
     ResBlockWeights res_blocks[3];
     Tensor w_raw_in_w, w_raw_in_b;
     MambaWeights mamba_layers[4];
@@ -106,6 +92,5 @@ private:
                                     Tensor& cache1, Tensor& cache2,
                                     bool& init1, bool& init2);
     Tensor mamba_forward_streaming(const Tensor& x, int layer_idx,
-                                    Tensor& conv_state, Tensor& ssm_state,
-                                    int& conv_pos);
+                                    Tensor& conv_state, Tensor& ssm_state);
 };

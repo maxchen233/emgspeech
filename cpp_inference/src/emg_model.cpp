@@ -1,7 +1,6 @@
 #include "emg_model.h"
 #include "ops.h"
 #include <cmath>
-#include <cstring>
 #include <iostream>
 
 // =====================================================================
@@ -55,11 +54,6 @@ void EmgModel::load(WeightMap& wm) {
         ml.A_log      = wm.get(p + ".A_log");
         ml.D          = wm.get(p + ".D");
         ml.out_proj_w = wm.get(p + ".out_proj.weight");
-        // Pre-compute A = -exp(A_log) to avoid repeated exp() in forward
-        ml.neg_exp_A = Tensor::zeros({d_inner, d_state});
-        for (int d = 0; d < d_inner; d++)
-            for (int s = 0; s < d_state; s++)
-                ml.neg_exp_A(d, s) = -std::exp(ml.A_log(d, s));
         ml.d_model = d_model;
         ml.d_inner = d_inner;
         ml.d_state = d_state;
@@ -99,105 +93,94 @@ Tensor EmgModel::resblock_forward(const Tensor& x_in, int idx) {
 
 Tensor EmgModel::mamba_forward(const Tensor& x_in, int layer_idx) {
     auto& ml = mamba_layers[layer_idx];
-    const int T = x_in.size(0);
-    const int D = ml.d_model;
-    const int DI = ml.d_inner;
-    const int DS = ml.d_state;
-    const int DR = ml.dt_rank;
+    int T = x_in.size(0);
+    int D = ml.d_model;
+    int DI = ml.d_inner;
+    int DS = ml.d_state;
+    int DR = ml.dt_rank;
 
-    // LayerNorm + in_proj (these use BLAS for batch, keep as-is)
+    Tensor residual = x_in.clone();
+
     Tensor x = ops::layer_norm(x_in, ml.norm_w, ml.norm_b);
     Tensor xz = ops::linear(x, ml.in_proj_w, Tensor::zeros({2 * DI}));
-    const float* xz_ptr = xz.ptr();
 
-    // Transpose x_part directly from xz to conv layout (DI, T)
-    // Eliminates: x_part tensor, separate transpose step
+    Tensor x_part = Tensor::zeros({T, DI});
+    Tensor z = Tensor::zeros({T, DI});
+    for (int t = 0; t < T; t++) {
+        for (int d = 0; d < DI; d++) {
+            x_part(t, d) = xz(t, d);
+            z(t, d) = xz(t, d + DI);
+        }
+    }
+
     Tensor x_conv_in = Tensor::zeros({DI, T});
-    float* xci_ptr = x_conv_in.ptr();
     for (int t = 0; t < T; t++)
         for (int d = 0; d < DI; d++)
-            xci_ptr[d * T + t] = xz_ptr[t * (2 * DI) + d];
+            x_conv_in(d, t) = x_part(t, d);
 
-    // Depthwise conv1d
     Tensor x_conv = ops::conv1d(x_conv_in, ml.conv1d_w, ml.conv1d_b,
                                 1, ml.d_conv - 1, DI);
+    Tensor x_conv_trimmed = Tensor::zeros({DI, T});
+    for (int d = 0; d < DI; d++)
+        for (int t = 0; t < T; t++)
+            x_conv_trimmed(d, t) = x_conv(d, t);
 
-    // Fused transpose (DI, L) -> (T, DI) + SiLU
-    // Eliminates: x_conv_trimmed tensor, separate silu_() call, x_silu transpose
-    const int conv_L = x_conv.size(1);
-    const float* xc_ptr = x_conv.ptr();
+    ops::silu_(x_conv_trimmed);
+
     Tensor x_silu = Tensor::zeros({T, DI});
-    float* xs_ptr = x_silu.ptr();
-    for (int t = 0; t < T; t++) {
-        for (int d = 0; d < DI; d++) {
-            float v = xc_ptr[d * conv_L + t];
-            xs_ptr[t * DI + d] = v / (1.0f + std::exp(-v));  // inline SiLU
-        }
-    }
-
-    // x_proj: (T, DI) -> (T, DR + 2*DS)
-    Tensor x_dbc = ops::linear(x_silu, ml.x_proj_w, Tensor::zeros({DR + 2 * DS}));
-    const float* x_dbc_ptr = x_dbc.ptr();
-    const int dbc_stride = DR + 2 * DS;
-
-    // dt_proj: extract delta_input (T, DR) from x_dbc, project to (T, DI)
-    Tensor delta_input = Tensor::zeros({T, DR});
-    float* di_ptr = delta_input.ptr();
     for (int t = 0; t < T; t++)
-        std::memcpy(di_ptr + t * DR, x_dbc_ptr + t * dbc_stride, DR * sizeof(float));
+        for (int d = 0; d < DI; d++)
+            x_silu(t, d) = x_conv_trimmed(d, t);
+
+    Tensor x_dbc = ops::linear(x_silu, ml.x_proj_w, Tensor::zeros({DR + 2 * DS}));
+
+    Tensor delta_input = Tensor::zeros({T, DR});
+    for (int t = 0; t < T; t++)
+        for (int r = 0; r < DR; r++)
+            delta_input(t, r) = x_dbc(t, r);
 
     Tensor delta = ops::linear(delta_input, ml.dt_proj_w, ml.dt_proj_b);
-    // Inline softplus
-    float* delta_ptr = delta.ptr();
-    for (int i = 0; i < T * DI; i++)
-        delta_ptr[i] = std::log(1.0f + std::exp(delta_ptr[i]));
+    ops::softplus_(delta);
 
-    // Selective scan with pre-computed A, fused gate
-    // Eliminates: A tensor recomputation, B_mat/C_mat tensors, separate silu_(z) + mul
-    const float* A_ptr = ml.neg_exp_A.ptr();
-    const float* D_ptr = ml.D.ptr();
-    Tensor h = Tensor::zeros({DI, DS});
-    float* h_ptr = h.ptr();
-    Tensor y = Tensor::zeros({T, DI});
-    float* y_ptr = y.ptr();
-
+    Tensor B_mat = Tensor::zeros({T, DS});
+    Tensor C_mat = Tensor::zeros({T, DS});
     for (int t = 0; t < T; t++) {
-        const float* dt_row = delta_ptr + t * DI;
-        const float* x_row = xs_ptr + t * DI;
-        const float* B_row = x_dbc_ptr + t * dbc_stride + DR;
-        const float* C_row = x_dbc_ptr + t * dbc_stride + DR + DS;
-        float* y_row = y_ptr + t * DI;
-
-        for (int d = 0; d < DI; d++) {
-            float dt = dt_row[d];
-            float x_t = x_row[d];
-            float y_val = 0;
-            float* h_d = h_ptr + d * DS;
-            const float* A_d = A_ptr + d * DS;
-
-            for (int s = 0; s < DS; s++) {
-                float dA = std::exp(dt * A_d[s]);
-                float dB = dt * B_row[s];
-                h_d[s] = h_d[s] * dA + dB * x_t;
-                y_val += h_d[s] * C_row[s];
-            }
-            y_val += D_ptr[d] * x_t;
-
-            // Inline gate: y * silu(z)  — z read directly from xz, no separate tensor
-            float z_val = xz_ptr[t * (2 * DI) + DI + d];
-            float silu_z = z_val / (1.0f + std::exp(-z_val));
-            y_row[d] = y_val * silu_z;
+        for (int s = 0; s < DS; s++) {
+            B_mat(t, s) = x_dbc(t, DR + s);
+            C_mat(t, s) = x_dbc(t, DR + DS + s);
         }
     }
 
-    // out_proj + inline residual addition (avoids clone + ops::add allocation)
-    Tensor out = ops::linear(y, ml.out_proj_w, Tensor::zeros({D}));
-    float* out_ptr = out.ptr();
-    const float* res_ptr = x_in.ptr();
-    for (int i = 0; i < T * D; i++)
-        out_ptr[i] += res_ptr[i];
+    Tensor A = Tensor::zeros({DI, DS});
+    for (int d = 0; d < DI; d++)
+        for (int s = 0; s < DS; s++)
+            A(d, s) = -std::exp(ml.A_log(d, s));
 
-    return out;
+    Tensor h = Tensor::zeros({DI, DS});
+    Tensor y = Tensor::zeros({T, DI});
+
+    for (int t = 0; t < T; t++) {
+        for (int d = 0; d < DI; d++) {
+            float dt = delta(t, d);
+            float x_t = x_silu(t, d);
+            float y_val = 0;
+
+            for (int s = 0; s < DS; s++) {
+                float dA = std::exp(dt * A(d, s));
+                float dB = dt * B_mat(t, s);
+                h(d, s) = h(d, s) * dA + dB * x_t;
+                y_val += h(d, s) * C_mat(t, s);
+            }
+
+            y_val += ml.D(d) * x_t;
+            y(t, d) = y_val;
+        }
+    }
+
+    ops::silu_(z);
+    y = ops::mul(y, z);
+    Tensor out = ops::linear(y, ml.out_proj_w, Tensor::zeros({D}));
+    return ops::add(residual, out);
 }
 
 Tensor EmgModel::forward(const Tensor& raw_emg) {
@@ -262,7 +245,6 @@ StreamingState EmgModel::init_streaming_state() {
     for (int i = 0; i < num_layers; i++) {
         state.mamba_conv_state[i] = Tensor::zeros({d_inner, d_conv});
         state.mamba_ssm_state[i]  = Tensor::zeros({d_inner, d_state});
-        state.conv_pos[i] = d_conv - 1;  // ring buffer: first (pos+1)%DC = 0
     }
 
     return state;
@@ -305,152 +287,124 @@ Tensor EmgModel::resblock_forward_causal(const Tensor& x_in, int idx,
 }
 
 Tensor EmgModel::mamba_forward_streaming(const Tensor& x_in, int layer_idx,
-                                          Tensor& conv_state, Tensor& ssm_state,
-                                          int& conv_pos_ref) {
-    // ── Fused Streaming Mamba Step ──────────────────────────────────
+                                          Tensor& conv_state, Tensor& ssm_state) {
+    // Streaming Mamba forward — step-by-step processing.
     //
-    // The entire per-timestep pipeline is fused into a single loop body
-    // with zero intermediate Tensor allocations. All workspace is pre-allocated
-    // in step_bufs_ and reused across timesteps.
+    // Matches Python: MambaBlock.forward_streaming() -> mamba.step()
     //
-    // Pipeline per timestep:
-    //   LayerNorm → in_proj → ring buffer conv → depthwise conv + SiLU
-    //   → x_proj → dt_proj + softplus → selective scan → gate → out_proj
-    //
-    // x_in: (T, D), conv_state: (d_inner, d_conv), ssm_state: (d_inner, d_state)
+    // x_in: (T, D)
+    // conv_state: (d_inner, d_conv) — updated in-place
+    // ssm_state:  (d_inner, d_state) — updated in-place
+    // output: (T, D)
 
     auto& ml = mamba_layers[layer_idx];
-    const int T = x_in.size(0);
-    const int D = ml.d_model;
-    const int DI = ml.d_inner;
-    const int DS = ml.d_state;
-    const int DR = ml.dt_rank;
-    const int DC = ml.d_conv;
+    int T = x_in.size(0);
+    int D = ml.d_model;
+    int DI = ml.d_inner;
+    int DS = ml.d_state;
+    int DR = ml.dt_rank;
+    int DC = ml.d_conv;
 
-    // Pre-allocate workspace buffers (resize is no-op after first call)
-    auto& bufs = step_bufs_;
-    bufs.x_norm.resize(D);
-    bufs.xz.resize(2 * DI);
-    bufs.x_conv.resize(DI);
-    bufs.x_dbc.resize(DR + 2 * DS);
-    bufs.delta.resize(DI);
-    bufs.y.resize(DI);
-    bufs.out.resize(D);
+    Tensor residual = x_in.clone();
 
-    // Cache raw pointers to weights (avoid repeated Tensor::ptr() calls)
-    const float* neg_A       = ml.neg_exp_A.ptr();
-    float*       conv_ptr    = conv_state.ptr();
-    float*       ssm_ptr     = ssm_state.ptr();
-    const float* norm_w_ptr  = ml.norm_w.ptr();
-    const float* norm_b_ptr  = ml.norm_b.ptr();
-    const float* in_proj_ptr = ml.in_proj_w.ptr();
-    const float* conv1d_w_ptr= ml.conv1d_w.ptr();
-    const float* conv1d_b_ptr= ml.conv1d_b.ptr();
-    const float* x_proj_ptr  = ml.x_proj_w.ptr();
-    const float* dt_proj_ptr = ml.dt_proj_w.ptr();
-    const float* dt_bias_ptr = ml.dt_proj_b.ptr();
-    const float* D_ptr       = ml.D.ptr();
-    const float* out_proj_ptr= ml.out_proj_w.ptr();
+    // Pre-compute A = -exp(A_log)
+    Tensor A = Tensor::zeros({DI, DS});
+    for (int d = 0; d < DI; d++)
+        for (int s = 0; s < DS; s++)
+            A(d, s) = -std::exp(ml.A_log(d, s));
 
     Tensor output = Tensor::zeros({T, D});
-    float* output_ptr = output.ptr();
-    const float* x_in_ptr = x_in.ptr();
 
-    const int dbc_dim = DR + 2 * DS;
-
+    // Process each timestep (mamba.step equivalent)
     for (int t = 0; t < T; t++) {
-        const float* x_t_in = x_in_ptr + t * D;
-        float* x_norm  = bufs.x_norm.data();
-        float* xz      = bufs.xz.data();
-        float* x_conv  = bufs.x_conv.data();
-        float* x_dbc   = bufs.x_dbc.data();
-        float* delta   = bufs.delta.data();
-        float* y       = bufs.y.data();
-        float* out     = bufs.out.data();
 
-        // ── 1. Inline LayerNorm ──────────────────────────────────
-        {
-            float mean = 0.0f;
-            for (int d = 0; d < D; d++) mean += x_t_in[d];
-            mean /= D;
-            float var = 0.0f;
-            for (int d = 0; d < D; d++) {
-                float diff = x_t_in[d] - mean;
-                var += diff * diff;
-            }
-            float inv_std = 1.0f / std::sqrt(var / D + 1e-5f);
-            for (int d = 0; d < D; d++) {
-                x_norm[d] = (x_t_in[d] - mean) * inv_std * norm_w_ptr[d] + norm_b_ptr[d];
-            }
+        // 1. Extract x_t from x_in
+        Tensor x_t = Tensor::zeros({D});
+        for (int d = 0; d < D; d++)
+            x_t.data[d] = x_in(t, d);
+
+        // 2. LayerNorm on single vector
+        x_t = ops::layer_norm_1d(x_t, ml.norm_w, ml.norm_b);
+
+        // 3. in_proj: (D) -> (2*DI)
+        Tensor xz = ops::linear_1d(x_t, ml.in_proj_w, Tensor::zeros({2 * DI}));
+
+        // Split: x_part = xz[:DI], z = xz[DI:]
+        Tensor x_part = Tensor::zeros({DI});
+        Tensor z = Tensor::zeros({DI});
+        for (int d = 0; d < DI; d++) {
+            x_part.data[d] = xz.data[d];
+            z.data[d] = xz.data[d + DI];
         }
 
-        // ── 2. Inline in_proj: (D) → (2*DI), no bias ────────────
-        ops::matvec_small(in_proj_ptr, 2 * DI, D, x_norm, nullptr, xz);
-
-        // x_part = xz[:DI], z = xz[DI:] — zero-copy via pointer offset
-        float* x_part = xz;
-        float* z_part = xz + DI;
-
-        // ── 3. Ring buffer conv_state update ─────────────────────
-        // O(DI) write instead of O(DI × DC) shift
-        conv_pos_ref = (conv_pos_ref + 1) % DC;
+        // 4. Update conv_state: shift left, insert x_part at right
         for (int d = 0; d < DI; d++) {
-            conv_ptr[d * DC + conv_pos_ref] = x_part[d];
+            for (int k = 0; k < DC - 1; k++) {
+                conv_state(d, k) = conv_state(d, k + 1);
+            }
+            conv_state(d, DC - 1) = x_part.data[d];
         }
 
-        // ── 4. Depthwise conv + inline SiLU ─────────────────────
+        // 5. Depthwise conv1d on conv_state
+        //    conv1d_w: (DI, 1, DC) — depthwise (groups=DI)
+        Tensor x_conv = Tensor::zeros({DI});
         for (int d = 0; d < DI; d++) {
-            float sum = conv1d_b_ptr[d];
-            const float* w_row = conv1d_w_ptr + d * DC;
-            const float* cs_row = conv_ptr + d * DC;
+            float sum = ml.conv1d_b.data[d];
             for (int k = 0; k < DC; k++) {
-                sum += cs_row[(conv_pos_ref + 1 + k) % DC] * w_row[k];
+                sum += conv_state(d, k) * ml.conv1d_w(d, 0, k);
             }
-            x_conv[d] = sum / (1.0f + std::exp(-sum));  // fused SiLU
+            x_conv.data[d] = sum;
         }
 
-        // ── 5. Inline x_proj: (DI) → (DR + 2*DS), no bias ──────
-        ops::matvec_small(x_proj_ptr, dbc_dim, DI, x_conv, nullptr, x_dbc);
+        // 6. SiLU
+        ops::silu_(x_conv);
 
-        // ── 6. Inline dt_proj + softplus ─────────────────────────
-        // dt_proj: (DR) → (DI), reads only first DR elements of x_dbc
-        ops::matvec_small(dt_proj_ptr, DI, DR, x_dbc, dt_bias_ptr, delta);
-        for (int d = 0; d < DI; d++) {
-            delta[d] = std::log(1.0f + std::exp(delta[d]));
-        }
+        // 7. x_proj: (DI) -> (DR + 2*DS)
+        Tensor x_dbc = ops::linear_1d(x_conv, ml.x_proj_w,
+                                       Tensor::zeros({DR + 2 * DS}));
 
-        // ── 7. Selective scan + D skip + gate ────────────────────
-        const float* B_ptr = x_dbc + DR;
-        const float* C_ptr = x_dbc + DR + DS;
+        // 8. dt_proj on first DR elements: (DR) -> (DI)
+        Tensor delta_input = Tensor::zeros({DR});
+        for (int r = 0; r < DR; r++)
+            delta_input.data[r] = x_dbc.data[r];
+
+        Tensor delta = ops::linear_1d(delta_input, ml.dt_proj_w, ml.dt_proj_b);
+        ops::softplus_(delta);
+
+        // 9. Selective scan step
+        Tensor y = Tensor::zeros({DI});
         for (int d = 0; d < DI; d++) {
-            float dt = delta[d];
-            float xc = x_conv[d];
-            float y_val = 0.0f;
-            float* h_row = ssm_ptr + d * DS;
-            const float* A_row = neg_A + d * DS;
+            float dt = delta.data[d];
+            float xc = x_conv.data[d];
+            float y_val = 0;
 
             for (int s = 0; s < DS; s++) {
-                float dA = std::exp(dt * A_row[s]);
-                float dB = dt * B_ptr[s];
-                h_row[s] = h_row[s] * dA + dB * xc;
-                y_val += h_row[s] * C_ptr[s];
+                float dA = std::exp(dt * A(d, s));
+                float B_s = x_dbc.data[DR + s];
+                float dB = dt * B_s;
+                ssm_state(d, s) = ssm_state(d, s) * dA + dB * xc;
+
+                float C_s = x_dbc.data[DR + DS + s];
+                y_val += ssm_state(d, s) * C_s;
             }
-            y_val += D_ptr[d] * xc;
 
-            // Inline gate: y * silu(z) — z read from xz buffer, no copy
-            float z_val = z_part[d];
-            y[d] = y_val * (z_val / (1.0f + std::exp(-z_val)));
+            y_val += ml.D.data[d] * xc;
+            y.data[d] = y_val;
         }
 
-        // ── 8. Inline out_proj + residual ────────────────────────
-        ops::matvec_small(out_proj_ptr, D, DI, y, nullptr, out);
-        float* out_row = output_ptr + t * D;
-        for (int d = 0; d < D; d++) {
-            out_row[d] = out[d] + x_t_in[d];  // residual added inline
-        }
+        // 10. Gate: y = y * silu(z)
+        ops::silu_(z);
+        y = ops::mul(y, z);
+
+        // 11. out_proj: (DI) -> (D)
+        Tensor out = ops::linear_1d(y, ml.out_proj_w, Tensor::zeros({D}));
+
+        // 12. Store (residual added at end)
+        for (int d = 0; d < D; d++)
+            output(t, d) = out.data[d];
     }
 
-    return output;
+    return ops::add(residual, output);
 }
 
 Tensor EmgModel::forward_streaming(const Tensor& raw_emg, StreamingState& state) {
@@ -487,12 +441,11 @@ Tensor EmgModel::forward_streaming(const Tensor& raw_emg, StreamingState& state)
     // w_raw_in
     x_tc = ops::linear(x_tc, w_raw_in_w, w_raw_in_b);
 
-    // Mamba layers (fused step-by-step processing)
+    // Mamba layers (step-by-step)
     for (int i = 0; i < num_layers; i++) {
         x_tc = mamba_forward_streaming(x_tc, i,
                                         state.mamba_conv_state[i],
-                                        state.mamba_ssm_state[i],
-                                        state.conv_pos[i]);
+                                        state.mamba_ssm_state[i]);
     }
 
     // Final norm + output head

@@ -66,24 +66,25 @@ Tensor linear_1d(const Tensor& input, const Tensor& weight, const Tensor& bias) 
 }
 
 Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
-              int stride, int padding, int groups) {
+              int stride, int padding, int groups, int dilation) {
     // input: (C_in, L)
     // weight: (C_out, C_in/groups, K)
     // output: (C_out, L_out)
+    // With dilation: L_out = (L + 2*padding - dilation*(K-1) - 1) / stride + 1
     int C_in = input.size(0);
     int L = input.size(1);
     int C_out = weight.size(0);
     int K = weight.size(2);
     int C_in_per_group = C_in / groups;
 
-    int L_out = (L + 2 * padding - K) / stride + 1;
+    int L_out = (L + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
     Tensor out = Tensor::zeros({C_out, L_out});
 
     int channels_per_group_out = C_out / groups;
 
-    // Use im2col + sgemm when groups==1 and K>1 (standard conv)
-    // For depthwise (groups>1) or pointwise (K==1), BLAS overhead isn't worth it
-    if (groups == 1 && K > 1) {
+    // Use im2col + sgemm when groups==1, K>1, and dilation==1 (standard conv)
+    // For dilated, depthwise (groups>1), or pointwise (K==1), use loop-based
+    if (groups == 1 && K > 1 && dilation == 1) {
         // im2col: unfold input into (L_out, C_in * K)
         int col_rows = L_out;
         int col_cols = C_in * K;
@@ -122,8 +123,7 @@ Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
             }
         }
     } else {
-        // Fallback: original loop-based implementation
-        // Efficient for depthwise conv (groups == C_in) and pointwise (K==1)
+        // Loop-based implementation (handles dilation, depthwise, pointwise)
         for (int g = 0; g < groups; g++) {
             int c_out_start = g * channels_per_group_out;
             int c_in_start = g * C_in_per_group;
@@ -133,7 +133,7 @@ Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
                     float sum = bias(co);
                     for (int ci = 0; ci < C_in_per_group; ci++) {
                         for (int ki = 0; ki < K; ki++) {
-                            int il = ol * stride + ki - padding;
+                            int il = ol * stride + ki * dilation - padding;
                             if (il >= 0 && il < L) {
                                 sum += input(c_in_start + ci, il) *
                                        weight(co, ci, ki);
@@ -145,6 +145,48 @@ Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
             }
         }
     }
+    return out;
+}
+
+Tensor conv_transpose1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                        int stride, int padding) {
+    // input: (C_in, L)
+    // weight: (C_in, C_out, K)  — note: PyTorch ConvTranspose1d weight shape
+    // output: (C_out, L_out)
+    // L_out = (L - 1) * stride - 2 * padding + K
+    int C_in = input.size(0);
+    int L = input.size(1);
+    int C_out = weight.size(1);
+    int K = weight.size(2);
+    int L_out = (L - 1) * stride - 2 * padding + K;
+
+    Tensor out = Tensor::zeros({C_out, L_out});
+
+    // Add bias
+    for (int co = 0; co < C_out; co++) {
+        float b = bias(co);
+        for (int ol = 0; ol < L_out; ol++) {
+            out(co, ol) = b;
+        }
+    }
+
+    // Scatter: for each input position, scatter to output positions
+    for (int ci = 0; ci < C_in; ci++) {
+        for (int il = 0; il < L; il++) {
+            float x_val = input(ci, il);
+            if (x_val == 0.0f) continue;  // skip zeros for efficiency
+
+            for (int k = 0; k < K; k++) {
+                int ol = il * stride + k - padding;
+                if (ol >= 0 && ol < L_out) {
+                    for (int co = 0; co < C_out; co++) {
+                        out(co, ol) += x_val * weight(ci, co, k);
+                    }
+                }
+            }
+        }
+    }
+
     return out;
 }
 
@@ -273,6 +315,16 @@ void silu_(Tensor& x) {
 void softplus_(Tensor& x) {
     for (auto& v : x.data)
         v = std::log(1.0f + std::exp(v));
+}
+
+void leaky_relu_(Tensor& x, float slope) {
+    for (auto& v : x.data)
+        v = v >= 0 ? v : slope * v;
+}
+
+void tanh_(Tensor& x) {
+    for (auto& v : x.data)
+        v = std::tanh(v);
 }
 
 Tensor add(const Tensor& a, const Tensor& b) {

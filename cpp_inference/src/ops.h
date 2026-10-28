@@ -11,7 +11,12 @@ Tensor linear_1d(const Tensor& input, const Tensor& weight, const Tensor& bias);
 
 // Conv1d: input(C_in, L), weight(C_out, C_in, K) -> (C_out, L_out)
 Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
-              int stride = 1, int padding = 0, int groups = 1);
+              int stride = 1, int padding = 0, int groups = 1, int dilation = 1);
+
+// ConvTranspose1d: input(C_in, L), weight(C_in, C_out, K) -> (C_out, L_out)
+// L_out = (L - 1) * stride - 2 * padding + K
+Tensor conv_transpose1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
+                        int stride = 1, int padding = 0);
 
 // Causal Conv1d with cache for streaming:
 //   input:  (C_in, T)
@@ -35,29 +40,13 @@ Tensor layer_norm_1d(const Tensor& input, const Tensor& weight, const Tensor& bi
 void relu_(Tensor& x);
 void silu_(Tensor& x);      // x * sigmoid(x)
 void softplus_(Tensor& x);  // log(1 + exp(x))
+void leaky_relu_(Tensor& x, float slope = 0.1f);
+void tanh_(Tensor& x);
 
 // Element-wise: out = a + b (same shape)
 Tensor add(const Tensor& a, const Tensor& b);
 
 // Element-wise multiply
 Tensor mul(const Tensor& a, const Tensor& b);
-
-// ── Inline helpers for fused kernels ────────────────────────────
-// Small matrix-vector multiply: out[i] = mat[i,:] · vec[:] + bias[i]
-// Faster than BLAS sgemv for dimensions typical of Mamba streaming steps.
-// mat: (rows, cols) row-major, vec: (cols), bias: (rows) or nullptr, out: (rows)
-inline void matvec_small(const float* __restrict__ mat, int rows, int cols,
-                         const float* __restrict__ vec,
-                         const float* __restrict__ bias,
-                         float* __restrict__ out) {
-    for (int i = 0; i < rows; i++) {
-        float sum = bias ? bias[i] : 0.0f;
-        const float* row = mat + i * cols;
-        for (int j = 0; j < cols; j++) {
-            sum += row[j] * vec[j];
-        }
-        out[i] = sum;
-    }
-}
 
 } // namespace ops
