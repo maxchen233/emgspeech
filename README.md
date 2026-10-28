@@ -1,4 +1,4 @@
-# EMG Silent Speech（中文說明）
+# EMG Silent Speech
 
 本專案用於研究與實作「靜音語音（Silent Speech）」：透過肌電訊號（EMG）推估語音內容，包含語音合成（EMG→Speech）與語音辨識（EMG→Text）相關流程。
 
@@ -11,10 +11,9 @@
 ## 目前功能概覽
 
 - EMG 到語音特徵／語音輸出流程
-- EMG 到文字辨識流程（CTC 路徑）
 - Mamba 相關模型訓練與掃描資料整合
-- 即時推論（realtime inference）與 C++ 推論系統嘗試
-- INT8 / QAT 方向模型訓練與部署嘗試
+- 即時推論（realtime inference）與 C++ 推論系統
+- pruning/INT8 / QAT 方向模型訓練與部署
 
 ## 環境建置（延續原專案流程）
 
