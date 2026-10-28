@@ -2,66 +2,115 @@
 #include <cmath>
 #include <cassert>
 #include <cblas.h>
+#include <cstring>
 
 namespace ops {
 
 Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias) {
     // input: (T, D_in), weight: (D_out, D_in), bias: (D_out)
-    // output: (T, D_out) = input × weight^T + bias
-    int T = input.size(0);
-    int D_in = input.size(1);
-    int D_out = weight.size(0);
+    // output: (T, D_out) = input * weight^T + bias
+    const int T = input.size(0);
+    const int D_in = input.size(1);
+    const int D_out = weight.size(0);
     assert(weight.size(1) == D_in);
+    assert(bias.numel() == D_out);
 
     Tensor out = Tensor::zeros({T, D_out});
 
-    // Pre-fill output rows with bias
-    for (int t = 0; t < T; t++) {
-        float* out_row = out.ptr() + t * D_out;
-        for (int j = 0; j < D_out; j++) {
-            out_row[j] = bias(j);
-        }
+    // Fill bias first, then accumulate GEMM into it.
+    for (int t = 0; t < T; ++t) {
+        float* row = out.ptr() + t * D_out;
+        std::memcpy(row, bias.ptr(), static_cast<size_t>(D_out) * sizeof(float));
     }
 
-    // out += input * weight^T
-    // input: (T, D_in) row-major  => M=T, K=D_in, lda=D_in
-    // weight: (D_out, D_in) row-major, transposed => N=D_out, ldb=D_in
-    // out: (T, D_out) row-major   => ldc=D_out
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 T, D_out, D_in,
-                1.0f,                       // alpha
-                input.ptr(), D_in,          // A, lda
-                weight.ptr(), D_in,         // B, ldb (transposed)
-                1.0f,                       // beta (accumulate onto bias)
-                out.ptr(), D_out);          // C, ldc
+                1.0f,
+                input.ptr(), D_in,
+                weight.ptr(), D_in,
+                1.0f,
+                out.ptr(), D_out);
+    return out;
+}
 
+Tensor linear_no_bias(const Tensor& input, const Tensor& weight) {
+    // input: (T, D_in), weight: (D_out, D_in)
+    // output: (T, D_out) = input * weight^T
+    const int T = input.size(0);
+    const int D_in = input.size(1);
+    const int D_out = weight.size(0);
+    assert(weight.size(1) == D_in);
+
+    Tensor out = Tensor::zeros({T, D_out});
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                T, D_out, D_in,
+                1.0f,
+                input.ptr(), D_in,
+                weight.ptr(), D_in,
+                0.0f,
+                out.ptr(), D_out);
+    return out;
+}
+
+Tensor linear_prefix(const Tensor& input, int prefix_cols,
+                     const Tensor& weight, const Tensor& bias) {
+    // Uses input[:, :prefix_cols] without copying it into a separate Tensor.
+    // Row-major GEMM supports a leading dimension larger than K.
+    const int T = input.size(0);
+    const int D_total = input.size(1);
+    const int D_out = weight.size(0);
+    assert(prefix_cols > 0 && prefix_cols <= D_total);
+    assert(weight.size(1) == prefix_cols);
+    assert(bias.numel() == D_out);
+
+    Tensor out = Tensor::zeros({T, D_out});
+    for (int t = 0; t < T; ++t) {
+        float* row = out.ptr() + t * D_out;
+        std::memcpy(row, bias.ptr(), static_cast<size_t>(D_out) * sizeof(float));
+    }
+
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                T, D_out, prefix_cols,
+                1.0f,
+                input.ptr(), D_total,      // lda keeps full row stride
+                weight.ptr(), prefix_cols,
+                1.0f,
+                out.ptr(), D_out);
     return out;
 }
 
 Tensor linear_1d(const Tensor& input, const Tensor& weight, const Tensor& bias) {
-    // input: (D_in), weight: (D_out, D_in), bias: (D_out)
-    // output: (D_out) = weight * input + bias   (matrix-vector multiply)
-    int D_in = input.size(0);
-    int D_out = weight.size(0);
+    const int D_in = input.size(0);
+    const int D_out = weight.size(0);
+    assert(weight.size(1) == D_in);
+    assert(bias.numel() == D_out);
+
+    Tensor out = Tensor::zeros({D_out});
+    std::memcpy(out.ptr(), bias.ptr(), static_cast<size_t>(D_out) * sizeof(float));
+
+    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                D_out, D_in,
+                1.0f,
+                weight.ptr(), D_in,
+                input.ptr(), 1,
+                1.0f,
+                out.ptr(), 1);
+    return out;
+}
+
+Tensor linear_1d_no_bias(const Tensor& input, const Tensor& weight) {
+    const int D_in = input.size(0);
+    const int D_out = weight.size(0);
     assert(weight.size(1) == D_in);
 
     Tensor out = Tensor::zeros({D_out});
-
-    // Copy bias into output first
-    for (int j = 0; j < D_out; j++) {
-        out.data[j] = bias(j);
-    }
-
-    // out = 1.0 * weight * input + 1.0 * out(bias)
-    // weight: (D_out, D_in) row-major => M=D_out, N=D_in, lda=D_in
     cblas_sgemv(CblasRowMajor, CblasNoTrans,
                 D_out, D_in,
-                1.0f,                       // alpha
-                weight.ptr(), D_in,         // A, lda
-                input.ptr(), 1,             // x, incx
-                1.0f,                       // beta (accumulate onto bias)
-                out.ptr(), 1);              // y, incy
-
+                1.0f,
+                weight.ptr(), D_in,
+                input.ptr(), 1,
+                0.0f,
+                out.ptr(), 1);
     return out;
 }
 
@@ -70,6 +119,7 @@ Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
     // input: (C_in, L)
     // weight: (C_out, C_in/groups, K)
     // output: (C_out, L_out)
+<<<<<<< Updated upstream
     int C_in = input.size(0);
     int L = input.size(1);
     int C_out = weight.size(0);
@@ -77,10 +127,31 @@ Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
     int C_in_per_group = C_in / groups;
 
     int L_out = (L + 2 * padding - K) / stride + 1;
+=======
+    const int C_in = input.size(0);
+    const int L = input.size(1);
+    const int C_out = weight.size(0);
+    const int K = weight.size(2);
+    const int C_in_per_group = C_in / groups;
+    const int L_out = (L + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+
+>>>>>>> Stashed changes
     Tensor out = Tensor::zeros({C_out, L_out});
+    const int channels_per_group_out = C_out / groups;
 
-    int channels_per_group_out = C_out / groups;
+    // Fast path for all ordinary non-dilated convolutions.
+    // The GEMM writes directly into the final (C_out, L_out) layout, avoiding
+    // the old temporary (L_out, C_out) result and full transpose.
+    if (groups == 1 && dilation == 1) {
+        if (K == 1) {
+            // Pointwise convolution: weight(C_out,C_in) * input(C_in,L_out).
+            // For stride/padding that makes input columns non-contiguous, pack
+            // only the sampled columns first.
+            const float* b_ptr = nullptr;
+            int b_ld = 0;
+            std::vector<float> packed;
 
+<<<<<<< Updated upstream
     // Use im2col + sgemm when groups==1 and K>1 (standard conv)
     // For depthwise (groups>1) or pointwise (K==1), BLAS overhead isn't worth it
     if (groups == 1 && K > 1) {
@@ -95,25 +166,44 @@ Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
                     int il = ol * stride + ki - padding;
                     if (il >= 0 && il < L) {
                         col[ol * col_cols + ci * K + ki] = input(ci, il);
+=======
+            if (stride == 1 && padding == 0 && L_out == L) {
+                b_ptr = input.ptr();
+                b_ld = L;
+            } else {
+                packed.assign(static_cast<size_t>(C_in) * L_out, 0.0f);
+                for (int ci = 0; ci < C_in; ++ci) {
+                    float* dst = packed.data() + static_cast<size_t>(ci) * L_out;
+                    const float* src = input.ptr() + static_cast<size_t>(ci) * L;
+                    for (int ol = 0; ol < L_out; ++ol) {
+                        const int il = ol * stride - padding;
+                        if (il >= 0 && il < L) dst[ol] = src[il];
+>>>>>>> Stashed changes
                     }
-                    // else: stays 0 (zero-padding)
                 }
+                b_ptr = packed.data();
+                b_ld = L_out;
             }
-        }
 
-        // weight reshaped as (C_out, C_in*K), already contiguous in memory
-        // out_T = col * weight^T  =>  (L_out, C_out)
-        // Then we transpose to (C_out, L_out)
-        std::vector<float> out_T(L_out * C_out, 0.0f);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        C_out, L_out, C_in,
+                        1.0f,
+                        weight.ptr(), C_in,
+                        b_ptr, b_ld,
+                        0.0f,
+                        out.ptr(), L_out);
+        } else {
+            // im2col stored as (C_in*K, L_out), so GEMM directly produces
+            // (C_out, L_out) with no post-GEMM transpose.
+            const int Kdim = C_in * K;
+            std::vector<float> col(static_cast<size_t>(Kdim) * L_out, 0.0f);
 
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    L_out, C_out, col_cols,
-                    1.0f,
-                    col.data(), col_cols,         // A = col, lda
-                    weight.ptr(), col_cols,       // B = weight, ldb (transposed)
-                    0.0f,
-                    out_T.data(), C_out);         // C = out_T, ldc
+            for (int ci = 0; ci < C_in; ++ci) {
+                const float* src = input.ptr() + static_cast<size_t>(ci) * L;
+                for (int ki = 0; ki < K; ++ki) {
+                    float* dst = col.data() + static_cast<size_t>(ci * K + ki) * L_out;
 
+<<<<<<< Updated upstream
         // Transpose (L_out, C_out) -> (C_out, L_out) and add bias
         for (int co = 0; co < C_out; co++) {
             float b = bias(co);
@@ -138,10 +228,60 @@ Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
                                 sum += input(c_in_start + ci, il) *
                                        weight(co, ci, ki);
                             }
+=======
+                    if (padding == 0 && stride == 1) {
+                        // Contiguous slice: input[ci, ki : ki+L_out]
+                        std::memcpy(dst, src + ki,
+                                    static_cast<size_t>(L_out) * sizeof(float));
+                    } else if (padding == 0) {
+                        for (int ol = 0; ol < L_out; ++ol) {
+                            dst[ol] = src[ol * stride + ki];
+                        }
+                    } else {
+                        for (int ol = 0; ol < L_out; ++ol) {
+                            const int il = ol * stride + ki - padding;
+                            if (il >= 0 && il < L) dst[ol] = src[il];
+>>>>>>> Stashed changes
                         }
                     }
-                    out(co, ol) = sum;
                 }
+            }
+
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        C_out, L_out, Kdim,
+                        1.0f,
+                        weight.ptr(), Kdim,
+                        col.data(), L_out,
+                        0.0f,
+                        out.ptr(), L_out);
+        }
+
+        // Bias is broadcast over time.
+        for (int co = 0; co < C_out; ++co) {
+            const float b = bias(co);
+            float* row = out.ptr() + static_cast<size_t>(co) * L_out;
+            for (int ol = 0; ol < L_out; ++ol) row[ol] += b;
+        }
+        return out;
+    }
+
+    // Generic path for dilated/depthwise/grouped convolutions.
+    for (int g = 0; g < groups; ++g) {
+        const int c_out_start = g * channels_per_group_out;
+        const int c_in_start = g * C_in_per_group;
+
+        for (int co = c_out_start; co < c_out_start + channels_per_group_out; ++co) {
+            for (int ol = 0; ol < L_out; ++ol) {
+                float sum = bias(co);
+                for (int ci = 0; ci < C_in_per_group; ++ci) {
+                    for (int ki = 0; ki < K; ++ki) {
+                        const int il = ol * stride + ki * dilation - padding;
+                        if (il >= 0 && il < L) {
+                            sum += input(c_in_start + ci, il) * weight(co, ci, ki);
+                        }
+                    }
+                }
+                out(co, ol) = sum;
             }
         }
     }
@@ -150,61 +290,41 @@ Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
 
 Tensor conv1d_causal(const Tensor& input, const Tensor& weight, const Tensor& bias,
                      int stride, Tensor& cache, bool& initialized, int groups) {
-    // Causal Conv1d with cache for streaming.
-    //
-    // input:  (C_in, T)     — new chunk
-    // weight: (C_out, C_in/groups, K)
-    // cache:  (C_in, K-1)   — left-context from previous chunk
-    //
-    // Strategy:
-    //   padded = cat(cache, input) along time axis   => (C_in, K-1 + T)
-    //   output = conv1d(padded, weight, bias, stride, padding=0, groups)
-    //   cache  = padded[:, -(K-1):]   (update for next call)
-    //
-    // This produces causal output: each output sample only depends on
-    // current and past input samples.
+    const int C_in = input.size(0);
+    const int T = input.size(1);
+    const int K = weight.size(2);
+    const int pad = K - 1;
+    const int L_padded = pad + T;
 
-    int C_in = input.size(0);
-    int T = input.size(1);
-    int K = weight.size(2);
-    int pad = K - 1;
-
-    // Build padded input: (C_in, pad + T)
-    int L_padded = pad + T;
     Tensor padded = Tensor::zeros({C_in, L_padded});
 
-    if (initialized) {
-        // Copy cache into the left part
-        assert(cache.size(0) == C_in && cache.size(1) == pad);
-        for (int c = 0; c < C_in; c++) {
-            for (int i = 0; i < pad; i++) {
-                padded(c, i) = cache(c, i);
-            }
+    // Copy by complete channel rows instead of scalar loops.
+    for (int c = 0; c < C_in; ++c) {
+        float* dst = padded.ptr() + static_cast<size_t>(c) * L_padded;
+        if (initialized && pad > 0) {
+            assert(cache.size(0) == C_in && cache.size(1) == pad);
+            const float* cache_row = cache.ptr() + static_cast<size_t>(c) * pad;
+            std::memcpy(dst, cache_row, static_cast<size_t>(pad) * sizeof(float));
         }
-    }
-    // else: left part stays zero (zero-padding for first chunk)
 
-    // Copy input into the right part
-    for (int c = 0; c < C_in; c++) {
-        for (int t = 0; t < T; t++) {
-            padded(c, pad + t) = input(c, t);
-        }
+        const float* src = input.ptr() + static_cast<size_t>(c) * T;
+        std::memcpy(dst + pad, src, static_cast<size_t>(T) * sizeof(float));
     }
 
-    // Update cache: last (K-1) columns of padded
     if (!initialized) {
         cache = Tensor::zeros({C_in, pad});
         initialized = true;
     }
-    for (int c = 0; c < C_in; c++) {
-        for (int i = 0; i < pad; i++) {
-            cache(c, i) = padded(c, L_padded - pad + i);
+
+    if (pad > 0) {
+        for (int c = 0; c < C_in; ++c) {
+            const float* src = padded.ptr() + static_cast<size_t>(c) * L_padded + (L_padded - pad);
+            float* dst = cache.ptr() + static_cast<size_t>(c) * pad;
+            std::memcpy(dst, src, static_cast<size_t>(pad) * sizeof(float));
         }
     }
 
-    // Run standard conv1d with padding=0 (now accelerated by BLAS when applicable)
-    Tensor out = conv1d(padded, weight, bias, stride, 0, groups);
-    return out;
+    return conv1d(padded, weight, bias, stride, 0, groups);
 }
 
 Tensor layer_norm(const Tensor& input, const Tensor& weight, const Tensor& bias,
@@ -277,22 +397,28 @@ void softplus_(Tensor& x) {
 
 Tensor add(const Tensor& a, const Tensor& b) {
     assert(a.numel() == b.numel());
-    Tensor out;
-    out.shape = a.shape;
-    out.data.resize(a.numel());
-    for (int i = 0; i < a.numel(); i++)
-        out.data[i] = a.data[i] + b.data[i];
+    Tensor out = a.clone();
+    add_(out, b);
     return out;
+}
+
+void add_(Tensor& a, const Tensor& b) {
+    assert(a.numel() == b.numel());
+    const int n = a.numel();
+    for (int i = 0; i < n; ++i) a.data[i] += b.data[i];
 }
 
 Tensor mul(const Tensor& a, const Tensor& b) {
     assert(a.numel() == b.numel());
-    Tensor out;
-    out.shape = a.shape;
-    out.data.resize(a.numel());
-    for (int i = 0; i < a.numel(); i++)
-        out.data[i] = a.data[i] * b.data[i];
+    Tensor out = a.clone();
+    mul_(out, b);
     return out;
+}
+
+void mul_(Tensor& a, const Tensor& b) {
+    assert(a.numel() == b.numel());
+    const int n = a.numel();
+    for (int i = 0; i < n; ++i) a.data[i] *= b.data[i];
 }
 
 } // namespace ops

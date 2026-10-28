@@ -6,8 +6,19 @@ namespace ops {
 // Linear: input(T, D_in) x weight(D_out, D_in)^T + bias(D_out) -> (T, D_out)
 Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias);
 
+// Linear without bias: input(T, D_in) x weight(D_out, D_in)^T -> (T, D_out)
+Tensor linear_no_bias(const Tensor& input, const Tensor& weight);
+
+// Linear using only the first prefix_cols features of each input row.
+// Useful for Mamba dt projection without materializing a separate delta_input tensor.
+Tensor linear_prefix(const Tensor& input, int prefix_cols,
+                     const Tensor& weight, const Tensor& bias);
+
 // Linear for single vector: input(D_in) x weight(D_out, D_in)^T + bias(D_out) -> (D_out)
 Tensor linear_1d(const Tensor& input, const Tensor& weight, const Tensor& bias);
+
+// Linear for single vector without bias.
+Tensor linear_1d_no_bias(const Tensor& input, const Tensor& weight);
 
 // Conv1d: input(C_in, L), weight(C_out, C_in, K) -> (C_out, L_out)
 Tensor conv1d(const Tensor& input, const Tensor& weight, const Tensor& bias,
@@ -38,9 +49,11 @@ void softplus_(Tensor& x);  // log(1 + exp(x))
 
 // Element-wise: out = a + b (same shape)
 Tensor add(const Tensor& a, const Tensor& b);
+void add_(Tensor& a, const Tensor& b);
 
 // Element-wise multiply
 Tensor mul(const Tensor& a, const Tensor& b);
+void mul_(Tensor& a, const Tensor& b);
 
 // ── Inline helpers for fused kernels ────────────────────────────
 // Small matrix-vector multiply: out[i] = mat[i,:] · vec[:] + bias[i]

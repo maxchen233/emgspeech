@@ -22,19 +22,85 @@ void EmgModel::load(WeightMap& wm) {
               << " d_state=" << d_state << " d_conv=" << d_conv
               << " d_inner=" << d_inner << " dt_rank=" << dt_rank << std::endl;
 
-    // ResBlocks
+    // ResBlocks — supports structurally-pruned internal widths.
+    // Example:
+    //   block0: 8   -> 136 -> 512
+    //   block1: 512 -> 320 -> 512
+    //   block2: 512 -> 328 -> 512
     for (int i = 0; i < 3; i++) {
         std::string p = "res" + std::to_string(i);
-        res_blocks[i].conv1_w = wm.get(p + ".conv1.weight");
-        res_blocks[i].conv1_b = wm.get(p + ".conv1.bias");
-        res_blocks[i].conv2_w = wm.get(p + ".conv2.weight");
-        res_blocks[i].conv2_b = wm.get(p + ".conv2.bias");
-        res_blocks[i].has_skip = wm.get_bool(p + ".has_skip");
-        if (res_blocks[i].has_skip) {
-            res_blocks[i].skip_w = wm.get(p + ".skip.weight");
-            res_blocks[i].skip_b = wm.get(p + ".skip.bias");
+        auto& rb = res_blocks[i];
+
+        rb.conv1_w = wm.get(p + ".conv1.weight");
+        rb.conv1_b = wm.get(p + ".conv1.bias");
+        rb.conv2_w = wm.get(p + ".conv2.weight");
+        rb.conv2_b = wm.get(p + ".conv2.bias");
+        rb.has_skip = wm.get_bool(p + ".has_skip");
+
+        if (rb.conv1_w.dim() != 3 || rb.conv2_w.dim() != 3) {
+            std::cerr << "ERROR: " << p
+                      << " conv weights must be 3-D Conv1d tensors." << std::endl;
+            std::exit(1);
         }
-        res_blocks[i].stride = 2;
+
+        rb.c_in  = rb.conv1_w.size(1);
+        rb.c_mid = rb.conv1_w.size(0);
+        rb.c_out = rb.conv2_w.size(0);
+
+        // Critical pruning compatibility check:
+        // conv2 input must equal pruned conv1 output.
+        if (rb.conv2_w.size(1) != rb.c_mid) {
+            std::cerr << "ERROR: " << p
+                      << " shape mismatch: conv1 out=" << rb.c_mid
+                      << " but conv2 in=" << rb.conv2_w.size(1)
+                      << std::endl;
+            std::exit(1);
+        }
+
+        if (rb.c_out != d_model) {
+            std::cerr << "ERROR: " << p
+                      << " output channels=" << rb.c_out
+                      << " but d_model=" << d_model
+                      << ". CNN->Mamba interface must remain d_model."
+                      << std::endl;
+            std::exit(1);
+        }
+
+        int expected_in = (i == 0) ? 8 : d_model;
+        if (rb.c_in != expected_in) {
+            std::cerr << "ERROR: " << p
+                      << " input channels=" << rb.c_in
+                      << ", expected " << expected_in << std::endl;
+            std::exit(1);
+        }
+
+        if (rb.conv1_b.numel() != rb.c_mid ||
+            rb.conv2_b.numel() != rb.c_out) {
+            std::cerr << "ERROR: " << p
+                      << " fused bias shape mismatch." << std::endl;
+            std::exit(1);
+        }
+
+        if (rb.has_skip) {
+            rb.skip_w = wm.get(p + ".skip.weight");
+            rb.skip_b = wm.get(p + ".skip.bias");
+
+            if (rb.skip_w.dim() != 3 ||
+                rb.skip_w.size(0) != rb.c_out ||
+                rb.skip_w.size(1) != rb.c_in ||
+                rb.skip_w.size(2) != 1) {
+                std::cerr << "ERROR: " << p
+                          << " skip shape mismatch." << std::endl;
+                std::exit(1);
+            }
+        }
+
+        rb.stride = 2;
+
+        std::cerr << "  " << p << ": "
+                  << rb.c_in << " -> "
+                  << rb.c_mid << " -> "
+                  << rb.c_out << std::endl;
     }
 
     w_raw_in_w = wm.get("w_raw_in.weight");
@@ -52,7 +118,17 @@ void EmgModel::load(WeightMap& wm) {
         ml.x_proj_w   = wm.get(p + ".x_proj.weight");
         ml.dt_proj_w  = wm.get(p + ".dt_proj.weight");
         ml.dt_proj_b  = wm.get(p + ".dt_proj.bias");
-        ml.A_log      = wm.get(p + ".A_log");
+
+        // A is constant during inference, so compute -exp(A_log) once at load
+        // time instead of once per layer per streaming chunk.
+        Tensor A_log = wm.get(p + ".A_log");
+        ml.A = Tensor::zeros({d_inner, d_state});
+        for (int d = 0; d < d_inner; ++d) {
+            for (int st = 0; st < d_state; ++st) {
+                ml.A(d, st) = -std::exp(A_log(d, st));
+            }
+        }
+
         ml.D          = wm.get(p + ".D");
         ml.out_proj_w = wm.get(p + ".out_proj.weight");
         // Pre-compute A = -exp(A_log) to avoid repeated exp() in forward
@@ -71,8 +147,10 @@ void EmgModel::load(WeightMap& wm) {
     final_norm_b = wm.get("final_norm.bias");
     w_out_w = wm.get("w_out.weight");
     w_out_b = wm.get("w_out.bias");
-    w_aux_w = wm.get("w_aux.weight");
-    w_aux_b = wm.get("w_aux.bias");
+    if (num_aux_outs > 0) {
+        w_aux_w = wm.get("w_aux.weight");
+        w_aux_b = wm.get("w_aux.bias");
+    }
 
     std::cerr << "Model loaded successfully." << std::endl;
 }
@@ -92,13 +170,14 @@ Tensor EmgModel::resblock_forward(const Tensor& x_in, int idx) {
     } else {
         res = x_in.clone();
     }
-    x = ops::add(x, res);
+    ops::add_(x, res);
     ops::relu_(x);
     return x;
 }
 
 Tensor EmgModel::mamba_forward(const Tensor& x_in, int layer_idx) {
     auto& ml = mamba_layers[layer_idx];
+<<<<<<< Updated upstream
     const int T = x_in.size(0);
     const int D = ml.d_model;
     const int DI = ml.d_inner;
@@ -109,6 +188,15 @@ Tensor EmgModel::mamba_forward(const Tensor& x_in, int layer_idx) {
     Tensor x = ops::layer_norm(x_in, ml.norm_w, ml.norm_b);
     Tensor xz = ops::linear(x, ml.in_proj_w, Tensor::zeros({2 * DI}));
     const float* xz_ptr = xz.ptr();
+=======
+    int T = x_in.size(0);
+    int DI = ml.d_inner;
+    int DS = ml.d_state;
+    int DR = ml.dt_rank;
+
+    Tensor x = ops::layer_norm(x_in, ml.norm_w, ml.norm_b);
+    Tensor xz = ops::linear_no_bias(x, ml.in_proj_w);
+>>>>>>> Stashed changes
 
     // Transpose x_part directly from xz to conv layout (DI, T)
     // Eliminates: x_part tensor, separate transpose step
@@ -127,6 +215,7 @@ Tensor EmgModel::mamba_forward(const Tensor& x_in, int layer_idx) {
     const int conv_L = x_conv.size(1);
     const float* xc_ptr = x_conv.ptr();
     Tensor x_silu = Tensor::zeros({T, DI});
+<<<<<<< Updated upstream
     float* xs_ptr = x_silu.ptr();
     for (int t = 0; t < T; t++) {
         for (int d = 0; d < DI; d++) {
@@ -197,6 +286,51 @@ Tensor EmgModel::mamba_forward(const Tensor& x_in, int layer_idx) {
     for (int i = 0; i < T * D; i++)
         out_ptr[i] += res_ptr[i];
 
+=======
+    for (int t = 0; t < T; t++)
+        for (int d = 0; d < DI; d++)
+            x_silu(t, d) = x_conv_trimmed(d, t);
+
+    Tensor x_dbc = ops::linear_no_bias(x_silu, ml.x_proj_w);
+
+    Tensor delta = ops::linear_prefix(x_dbc, DR, ml.dt_proj_w, ml.dt_proj_b);
+    ops::softplus_(delta);
+
+    Tensor B_mat = Tensor::zeros({T, DS});
+    Tensor C_mat = Tensor::zeros({T, DS});
+    for (int t = 0; t < T; t++) {
+        for (int s = 0; s < DS; s++) {
+            B_mat(t, s) = x_dbc(t, DR + s);
+            C_mat(t, s) = x_dbc(t, DR + DS + s);
+        }
+    }
+
+    Tensor h = Tensor::zeros({DI, DS});
+    Tensor y = Tensor::zeros({T, DI});
+
+    for (int t = 0; t < T; t++) {
+        for (int d = 0; d < DI; d++) {
+            float dt = delta(t, d);
+            float x_t = x_silu(t, d);
+            float y_val = 0;
+
+            for (int s = 0; s < DS; s++) {
+                float dA = std::exp(dt * ml.A(d, s));
+                float dB = dt * B_mat(t, s);
+                h(d, s) = h(d, s) * dA + dB * x_t;
+                y_val += h(d, s) * C_mat(t, s);
+            }
+
+            y_val += ml.D(d) * x_t;
+            y(t, d) = y_val;
+        }
+    }
+
+    ops::silu_(z);
+    ops::mul_(y, z);
+    Tensor out = ops::linear_no_bias(y, ml.out_proj_w);
+    ops::add_(out, x_in);
+>>>>>>> Stashed changes
     return out;
 }
 
@@ -242,7 +376,11 @@ EmgModel::LayerOutputs EmgModel::forward_debug(const Tensor& raw_emg) {
     out.after_final_norm = x_tc.clone();
 
     out.mel_output = ops::linear(x_tc, w_out_w, w_out_b);
-    out.aux_output = ops::linear(x_tc, w_aux_w, w_aux_b);
+    if (num_aux_outs > 0) {
+        out.aux_output = ops::linear(x_tc, w_aux_w, w_aux_b);
+    } else {
+        out.aux_output = Tensor();
+    }
 
     return out;
 }
@@ -299,12 +437,13 @@ Tensor EmgModel::resblock_forward_causal(const Tensor& x_in, int idx,
         res = x_in.clone();
     }
 
-    x = ops::add(x, res);
+    ops::add_(x, res);
     ops::relu_(x);
     return x;
 }
 
 Tensor EmgModel::mamba_forward_streaming(const Tensor& x_in, int layer_idx,
+<<<<<<< Updated upstream
                                           Tensor& conv_state, Tensor& ssm_state,
                                           int& conv_pos_ref) {
     // ── Fused Streaming Mamba Step ──────────────────────────────────
@@ -322,10 +461,27 @@ Tensor EmgModel::mamba_forward_streaming(const Tensor& x_in, int layer_idx,
     auto& ml = mamba_layers[layer_idx];
     const int T = x_in.size(0);
     const int D = ml.d_model;
+=======
+                                          Tensor& conv_state, Tensor& ssm_state) {
+    // Optimized streaming Mamba.
+    //
+    // The projections are independent across time, so compute them for the
+    // whole chunk with SGEMM. Only the depthwise causal convolution and the
+    // selective scan keep their recurrent state across timesteps.
+    //
+    // x_in:      (T, d_model)
+    // conv_state:(d_inner, d_conv)
+    // ssm_state: (d_inner, d_state)
+    // output:    (T, d_model)
+
+    auto& ml = mamba_layers[layer_idx];
+    const int T  = x_in.size(0);
+>>>>>>> Stashed changes
     const int DI = ml.d_inner;
     const int DS = ml.d_state;
     const int DR = ml.dt_rank;
     const int DC = ml.d_conv;
+<<<<<<< Updated upstream
 
     // Pre-allocate workspace buffers (resize is no-op after first call)
     auto& bufs = step_bufs_;
@@ -434,9 +590,43 @@ Tensor EmgModel::mamba_forward_streaming(const Tensor& x_in, int layer_idx,
                 float dB = dt * B_ptr[s];
                 h_row[s] = h_row[s] * dA + dB * xc;
                 y_val += h_row[s] * C_ptr[s];
+=======
+    const int DBC = DR + 2 * DS;
+
+    // 1) LayerNorm for the whole chunk.
+    Tensor x_norm = ops::layer_norm(x_in, ml.norm_w, ml.norm_b);
+
+    // 2) in_proj for all frames at once: (T,D) -> (T,2*DI).
+    Tensor xz = ops::linear_no_bias(x_norm, ml.in_proj_w);
+
+    // 3) Stateful depthwise causal convolution.
+    // Process one channel at a time across the entire chunk. Channels are
+    // independent, making this loop safe to parallelize with OpenMP.
+    Tensor x_conv = Tensor::zeros({T, DI});
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(DI >= 256)
+    #endif
+    for (int d = 0; d < DI; ++d) {
+        float* state_row = conv_state.ptr() + static_cast<size_t>(d) * DC;
+        const float* w_row = ml.conv1d_w.ptr() + static_cast<size_t>(d) * DC;
+        const float bias = ml.conv1d_b.data[d];
+
+        for (int t = 0; t < T; ++t) {
+            // Equivalent to the original shift-left + insert x_part.
+            for (int k = 0; k < DC - 1; ++k) {
+                state_row[k] = state_row[k + 1];
+            }
+            state_row[DC - 1] = xz(t, d);  // x_part = first DI columns
+
+            float v = bias;
+            for (int k = 0; k < DC; ++k) {
+                v += state_row[k] * w_row[k];
+>>>>>>> Stashed changes
             }
             y_val += D_ptr[d] * xc;
 
+<<<<<<< Updated upstream
             // Inline gate: y * silu(z) — z read from xz buffer, no copy
             float z_val = z_part[d];
             y[d] = y_val * (z_val / (1.0f + std::exp(-z_val)));
@@ -451,6 +641,61 @@ Tensor EmgModel::mamba_forward_streaming(const Tensor& x_in, int layer_idx,
     }
 
     return output;
+=======
+            // SiLU in-place while the value is hot in a register.
+            x_conv(t, d) = v / (1.0f + std::exp(-v));
+        }
+    }
+
+    // 4) x_proj for all frames: (T,DI) -> (T,DR+2*DS).
+    Tensor x_dbc = ops::linear_no_bias(x_conv, ml.x_proj_w);
+
+    // 5) dt_proj only needs x_dbc[:, :DR]. linear_prefix uses the original
+    // row stride directly, avoiding a separate delta_input allocation/copy.
+    Tensor delta = ops::linear_prefix(x_dbc, DR, ml.dt_proj_w, ml.dt_proj_b);
+    ops::softplus_(delta);
+
+    // 6) Stateful selective scan. Different d_inner channels are independent,
+    // so parallelize over d while each thread walks time in order.
+    Tensor y = Tensor::zeros({T, DI});
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(DI >= 256)
+    #endif
+    for (int d = 0; d < DI; ++d) {
+        float* h_row = ssm_state.ptr() + static_cast<size_t>(d) * DS;
+        const float* A_row = ml.A.ptr() + static_cast<size_t>(d) * DS;
+        const float D_d = ml.D.data[d];
+
+        for (int t = 0; t < T; ++t) {
+            const float dt = delta(t, d);
+            const float xc = x_conv(t, d);
+            const float* dbc_row = x_dbc.ptr() + static_cast<size_t>(t) * DBC;
+            const float* B_row = dbc_row + DR;
+            const float* C_row = B_row + DS;
+
+            float y_val = 0.0f;
+            for (int st = 0; st < DS; ++st) {
+                const float dA = std::exp(dt * A_row[st]);
+                h_row[st] = h_row[st] * dA + (dt * B_row[st]) * xc;
+                y_val += h_row[st] * C_row[st];
+            }
+
+            y_val += D_d * xc;
+
+            // Gate with silu(z). z is the second half of xz, so no split tensor
+            // is needed.
+            const float z = xz(t, DI + d);
+            const float z_silu = z / (1.0f + std::exp(-z));
+            y(t, d) = y_val * z_silu;
+        }
+    }
+
+    // 7) out_proj for all frames, then residual add in place.
+    Tensor out = ops::linear_no_bias(y, ml.out_proj_w);
+    ops::add_(out, x_in);
+    return out;
+>>>>>>> Stashed changes
 }
 
 Tensor EmgModel::forward_streaming(const Tensor& raw_emg, StreamingState& state) {

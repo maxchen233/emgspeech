@@ -4,11 +4,17 @@
 
 // ── ResBlock weights (BN already fused) ─────────────────────────
 struct ResBlockWeights {
-    Tensor conv1_w, conv1_b;  // (C_out, C_in, 3)
-    Tensor conv2_w, conv2_b;  // (C_out, C_out, 3)
+    // Network-Slimming compatible:
+    // conv1: C_in -> C_mid
+    // conv2: C_mid -> C_out (= d_model)
+    Tensor conv1_w, conv1_b;  // (C_mid, C_in, 3)
+    Tensor conv2_w, conv2_b;  // (C_out, C_mid, 3)
     bool has_skip;
     Tensor skip_w, skip_b;    // (C_out, C_in, 1) if has_skip
     int stride;
+    int c_in = 0;
+    int c_mid = 0;
+    int c_out = 0;
 };
 
 // ── Mamba layer weights ─────────────────────────────────────────
@@ -18,7 +24,7 @@ struct MambaWeights {
     Tensor conv1d_w, conv1d_b;    // (d_inner, 1, d_conv), (d_inner)
     Tensor x_proj_w;              // (dt_rank + 2*d_state, d_inner)
     Tensor dt_proj_w, dt_proj_b;  // (d_inner, dt_rank), (d_inner)
-    Tensor A_log;                 // (d_inner, d_state)
+    Tensor A;                     // precomputed -exp(A_log), (d_inner, d_state)
     Tensor D;                     // (d_inner)
     Tensor out_proj_w;            // (d_model, d_inner)
     Tensor neg_exp_A;             // pre-computed -exp(A_log), (d_inner, d_state)
@@ -30,7 +36,7 @@ struct MambaWeights {
 struct StreamingState {
     // CNN causal conv caches: 3 blocks x 2 convs per block
     // cache1[i]: (C_in, K-1) where K=3 -> (C_in, 2)
-    // cache2[i]: (C_out, K-1) -> (C_out, 2)
+    // cache2[i]: (C_mid, K-1) -> pruned internal width, e.g. 136/320/328
     Tensor cnn_cache1[3], cnn_cache2[3];
     bool cnn_init1[3], cnn_init2[3];
 
@@ -73,6 +79,9 @@ public:
     // Accessors
     int get_num_outs() const { return num_outs; }
     int get_d_model() const { return d_model; }
+    int get_cnn_mid_channels(int i) const {
+        return (i >= 0 && i < 3) ? res_blocks[i].c_mid : 0;
+    }
 
 private:
     int d_model, num_layers, d_state, d_conv, d_inner, dt_rank;
