@@ -25,8 +25,19 @@ import soundfile as sf
 
 import torch
 
+from absl import flags
+FLAGS = flags.FLAGS
 
-AUDIO_SR = 22050
+
+def get_audio_sr():
+    """All remaining vocoder backends synthesize 22.05-kHz audio."""
+    return 22050
+
+def get_hop_size():
+    return 256
+
+
+AUDIO_SR = 22050  # 預設值, 會在 StreamingPipeline.__init__ 中動態更新
 HOP_SIZE = 256
 SENTINEL = None
 SENTINEL_BYTES = b'__END__'
@@ -92,6 +103,9 @@ class StreamingPipeline:
         self.vocoder_chunk_size = vocoder_chunk_size
         self.play_mode = play_mode
         self.chunk_output_dir = chunk_output_dir
+
+        # 動態設定 sample rate
+        self.audio_sr = get_audio_sr()
 
         self.emg_queue = queue.Queue(maxsize=64)
         self.processed_queue = queue.Queue(maxsize=64)

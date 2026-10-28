@@ -19,12 +19,12 @@ from vocoder import Vocoder
 
 from absl import flags
 FLAGS = flags.FLAGS
-flags.DEFINE_integer('batch_size', 16, 'training batch size')
+flags.DEFINE_integer('batch_size', 32, 'training batch size')
 flags.DEFINE_integer('epochs', 80, 'number of training epochs')
 flags.DEFINE_float('learning_rate', 1e-3, 'learning rate')
 flags.DEFINE_integer('learning_rate_patience', 5, 'learning rate decay patience')
 flags.DEFINE_integer('learning_rate_warmup', 500, 'steps of linear warmup')
-flags.DEFINE_string('start_training_from', "./models/transduction_model/model.pt", 'start training from this model')
+flags.DEFINE_string('start_training_from', None, 'start training from this model')
 flags.DEFINE_float('data_size_fraction', 1.0, 'fraction of training data to use')
 flags.DEFINE_float('phoneme_loss_weight', 0.5, 'weight of auxiliary phoneme prediction loss')
 flags.DEFINE_float('l2', 1e-7, 'weight decay')
@@ -163,7 +163,7 @@ def train_model(trainset, devset, device, save_sound_outputs=True):
         training_subset = trainset
     else:
         training_subset = trainset.subset(FLAGS.data_size_fraction)
-    dataloader = torch.utils.data.DataLoader(training_subset, pin_memory=(device=='cuda'), collate_fn=devset.collate_raw, num_workers=0, batch_sampler=SizeAwareSampler(training_subset, 64000))
+    dataloader = torch.utils.data.DataLoader(training_subset, pin_memory=(device=='cuda'), collate_fn=devset.collate_raw, num_workers=0, batch_sampler=SizeAwareSampler(training_subset, 256000))
 
     n_phones = len(phoneme_inventory)
     model = Model(devset.num_features, devset.num_speech_features, n_phones).to(device)
@@ -206,8 +206,6 @@ def train_model(trainset, devset, device, save_sound_outputs=True):
             loss, _ = dtw_loss(pred, phoneme_pred, batch)
             losses.append(loss.item())
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             loss.backward()
             optim.step()
 
@@ -216,15 +214,7 @@ def train_model(trainset, devset, device, save_sound_outputs=True):
         val, phoneme_acc, _ = test(model, devset, device)
         lr_sched.step(val)
         logging.info(f'finished epoch {epoch_idx+1} - validation loss: {val:.4f} training loss: {train_loss:.4f} phoneme accuracy: {phoneme_acc*100:.2f}')
-        
         torch.save(model.state_dict(), os.path.join(FLAGS.output_directory,'model.pt'))
-        if save_sound_outputs:
-           # 加入這行！讓終端機印出它正在生成哪一句話：
-            print(f"\n🎧 正在生成驗證音訊...")
-            print(f"👉 檔案編號: {devset[0]['file_label']}")
-            print(f"👉 真實文字: {devset[0]['text']}\n")
-            
-            save_output(model, devset[0], os.path.join(FLAGS.output_directory, f'epoch_{epoch_idx}_output.wav'), device, devset.mfcc_norm, vocoder)
         if save_sound_outputs:
             save_output(model, devset[0], os.path.join(FLAGS.output_directory, f'epoch_{epoch_idx}_output.wav'), device, devset.mfcc_norm, vocoder)
 

@@ -1,4 +1,9 @@
 import string
+import os
+import subprocess
+import tempfile
+import struct
+import logging
 
 import numpy as np
 import librosa
@@ -81,6 +86,206 @@ def load_audio(filename, start=None, end=None, max_frames=None, renormalize_volu
     if max_frames is not None and mspec.shape[0] > max_frames:
         mspec = mspec[:max_frames,:]
     return mspec
+
+# ── FARGAN/LPCNet 特徵提取常數 ────────────────────────────────
+LPCNET_SR = 16000           # LPCNet/FARGAN 取樣率
+LPCNET_FRAME_SIZE = 160     # 10ms @16kHz
+LPCNET_HOP_SIZE = 160       # 幀間隔 (= frame_size, 無重疊)
+LPCNET_NB_FEATURES = 20     # 18 Bark cepstral + 2 pitch
+LPCNET_NB_BANDS = 18        # Bark-scale cepstral bands
+LPCNET_DUMP_NB_FEATURES = 36  # dump_data 輸出的原始特徵數 (取前 20)
+_dump_data_disabled = False  # 第一次失敗後設為 True, 避免重複警告
+
+# Bark-scale 中心頻率 (用於 Python fallback)
+# 18 個 Bark band 的邊界頻率 (Hz), 近似對應 LPCNet 的 Bark-scale
+BARK_BAND_EDGES = [0, 100, 200, 300, 400, 510, 630, 770, 920, 1080,
+                   1270, 1480, 1720, 2000, 2320, 2700, 3150, 3700, 4400,
+                   5300, 6400, 7700]
+
+
+def load_audio_lpcnet(filename, start=None, end=None, max_frames=None,
+                      renormalize_volume=False):
+    """
+    從音訊檔案提取 LPCNet/FARGAN 20-dim 特徵
+
+    輸出: (T, 20) float32
+        - dim 0-17: 18 Bark-scale cepstral coefficients
+        - dim 18:   pitch period (samples @16kHz, range 32-256)
+        - dim 19:   pitch correlation (0-1)
+
+    優先使用 opus dump_data 二進位工具 (精確), 否則用 Python 近似版本。
+    特徵會快取為 .npy 檔案以加速後續載入。
+    """
+    # ── 磁碟快取：避免重複計算 ─────────────────────────────────
+    # 快取 key 包含 start/end/renormalize 以區分不同參數的呼叫
+    cache_suffix = '_lpcnet_features'
+    if start is not None or end is not None:
+        cache_suffix += f'_s{start}_e{end}'
+    if renormalize_volume:
+        cache_suffix += '_renorm'
+    cache_path = os.path.splitext(filename)[0] + cache_suffix + '.npy'
+
+    # 檢查快取是否有效 (存在 且 比音訊檔案新)
+    if os.path.exists(cache_path):
+        try:
+            audio_mtime = os.path.getmtime(filename)
+            cache_mtime = os.path.getmtime(cache_path)
+            if cache_mtime >= audio_mtime:
+                features = np.load(cache_path)
+                if max_frames is not None and features.shape[0] > max_frames:
+                    features = features[:max_frames, :]
+                return features
+        except Exception:
+            pass  # 快取損壞，重新提取
+
+    # ── 正常提取流程 ──────────────────────────────────────────
+    audio, r = sf.read(filename)
+
+    if len(audio.shape) > 1:
+        audio = audio[:, 0]
+    if start is not None or end is not None:
+        audio = audio[start:end]
+    if renormalize_volume:
+        audio = normalize_volume(audio)
+
+    # 統一 resample 到 16kHz
+    if r != LPCNET_SR:
+        audio = librosa.resample(audio, orig_sr=r, target_sr=LPCNET_SR)
+    audio = np.clip(audio, -1, 1).astype(np.float32)
+
+    # 嘗試使用 dump_data 工具 (失敗一次後不再嘗試)
+    global _dump_data_disabled
+    dump_data_bin = FLAGS.dump_data_bin if hasattr(FLAGS, 'dump_data_bin') else './dump_data'
+    if not _dump_data_disabled and os.path.isfile(dump_data_bin) and os.access(dump_data_bin, os.X_OK):
+        features = _extract_features_dump_data(audio, dump_data_bin)
+    else:
+        features = _extract_features_python(audio)
+
+    # ── 存入快取 ──────────────────────────────────────────────
+    try:
+        np.save(cache_path, features)
+    except Exception as e:
+        logging.warning(f'無法儲存特徵快取 {cache_path}: {e}')
+
+    if max_frames is not None and features.shape[0] > max_frames:
+        features = features[:max_frames, :]
+
+    return features
+
+
+def _extract_features_dump_data(audio, dump_data_bin):
+    """
+    使用 opus dump_data 工具提取特徵 (最精確)
+
+    dump_data -test input.s16 features.f32
+    輸出: 每幀 36 個 float32, 我們只取前 20 個
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pcm_path = os.path.join(tmpdir, 'input.s16')
+        feat_path = os.path.join(tmpdir, 'features.f32')
+
+        # 寫入 16-bit PCM
+        pcm_i16 = (audio * 32767).astype(np.int16)
+        pcm_i16.tofile(pcm_path)
+
+        # 執行 dump_data
+        try:
+            subprocess.run(
+                [dump_data_bin, '-test', pcm_path, feat_path],
+                check=True, capture_output=True, timeout=60
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            global _dump_data_disabled
+            _dump_data_disabled = True
+            print(f'Warning: dump_data failed ({e}), falling back to Python extraction (this warning will not repeat)')
+            return _extract_features_python(audio)
+
+        # 讀取特徵 (每幀 36 個 float32)
+        features_raw = np.fromfile(feat_path, dtype=np.float32)
+        nb_frames = len(features_raw) // LPCNET_DUMP_NB_FEATURES
+        features_raw = features_raw[:nb_frames * LPCNET_DUMP_NB_FEATURES]
+        features_raw = features_raw.reshape(nb_frames, LPCNET_DUMP_NB_FEATURES)
+
+        # 只取前 20 維
+        features = features_raw[:, :LPCNET_NB_FEATURES]
+
+    return features.astype(np.float32)
+
+
+def _extract_features_python(audio):
+    """
+    純 Python 近似 LPCNet 特徵提取 (fallback)
+
+    使用 librosa 計算:
+      - 18-dim Bark-scale cepstral coefficients (近似)
+      - pitch period + pitch correlation
+
+    注意: 這不是 LPCNet 的精確實作, 但在沒有 dump_data 時可以用來
+    做初步實驗。建議正式訓練時使用 dump_data。
+    """
+    sr = LPCNET_SR
+    frame_length = LPCNET_FRAME_SIZE    # 160 samples = 10ms
+    hop_length = LPCNET_FRAME_SIZE      # 無重疊
+
+    # ── Bark-scale cepstral coefficients ────────────────────────
+    # 使用較接近 Bark 尺度的 mel filterbank (fmin=0, fmax=8000, n_mels=18)
+    # Bark 和 mel 在低頻區很接近，在高頻區有差異但可接受
+    n_fft = 320  # 20ms window for better frequency resolution
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio, sr=sr, n_fft=n_fft,
+        hop_length=hop_length, win_length=frame_length,
+        n_mels=LPCNET_NB_BANDS,
+        fmin=0, fmax=sr // 2,
+        center=False
+    )
+
+    # Log compress + DCT → cepstral coefficients
+    log_mel = np.log(np.maximum(mel_spec, 1e-10))
+
+    # DCT (type II) 轉為 cepstral domain, 保留 18 個係數
+    from scipy.fftpack import dct
+    bark_cepstral = dct(log_mel.T, type=2, norm='ortho', axis=1)[:, :LPCNET_NB_BANDS]
+    # shape: (T, 18)
+
+    # ── Pitch 提取 ─────────────────────────────────────────────
+    # 使用 librosa pyin 做 F0 估計
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        audio, fmin=100, fmax=500, sr=sr,
+        frame_length=frame_length * 2,
+        hop_length=hop_length,
+        center=False
+    )
+
+    # 確保長度對齊
+    n_frames = bark_cepstral.shape[0]
+    if len(f0) > n_frames:
+        f0 = f0[:n_frames]
+        voiced_prob = voiced_prob[:n_frames]
+    elif len(f0) < n_frames:
+        pad_len = n_frames - len(f0)
+        f0 = np.pad(f0, (0, pad_len), mode='edge')
+        voiced_prob = np.pad(voiced_prob, (0, pad_len), mode='edge')
+
+    # F0 → pitch period (samples @16kHz)
+    # LPCNet pitch period 範圍: 32-256 samples
+    pitch_period = np.where(
+        np.isnan(f0) | (f0 < 1),
+        256.0,  # unvoiced → max period
+        np.clip(sr / f0, 32, 256)
+    )
+
+    # pitch correlation (voiced probability)
+    pitch_corr = np.where(np.isnan(voiced_prob), 0.0, voiced_prob)
+    pitch_corr = np.clip(pitch_corr, 0, 1)
+
+    # ── 組合 20-dim 特徵 ───────────────────────────────────────
+    features = np.zeros((n_frames, LPCNET_NB_FEATURES), dtype=np.float32)
+    features[:, :LPCNET_NB_BANDS] = bark_cepstral
+    features[:, LPCNET_NB_BANDS] = pitch_period
+    features[:, LPCNET_NB_BANDS + 1] = pitch_corr
+
+    return features
+
 
 def double_average(x):
     assert len(x.shape) == 1
@@ -220,9 +425,11 @@ def print_confusion(confusion_mat, n=10):
         p2s = phoneme_inventory[p2]
         print(f'{p1s} {p2s} {v*100:.1f} {(confusion_mat[p1,p1]+confusion_mat[p2,p2])/(target_counts[p1]+target_counts[p2])*100:.1f}')
 
-def read_phonemes(textgrid_fname, max_len=None):
+def read_phonemes(textgrid_fname, max_len=None, frame_rate=None):
+    if frame_rate is None:
+        frame_rate = 86.133
     tg = TextGrid(textgrid_fname)
-    phone_ids = np.zeros(int(tg['phones'][-1].xmax*86.133)+1, dtype=np.int64)
+    phone_ids = np.zeros(int(tg['phones'][-1].xmax * frame_rate) + 1, dtype=np.int64)
     phone_ids[:] = -1
     phone_ids[-1] = phoneme_inventory.index('sil') # make sure list is long enough to cover full length of original sequence
     for interval in tg['phones']:
@@ -232,7 +439,7 @@ def read_phonemes(textgrid_fname, max_len=None):
         if phone[-1] in string.digits:
             phone = phone[:-1]
         ph_id = phoneme_inventory.index(phone)
-        phone_ids[int(interval.xmin*86.133):int(interval.xmax*86.133)] = ph_id
+        phone_ids[int(interval.xmin * frame_rate):int(interval.xmax * frame_rate)] = ph_id
     assert (phone_ids >= 0).all(), 'missing aligned phones'
 
     if max_len is not None:

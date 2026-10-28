@@ -23,6 +23,7 @@ flags.DEFINE_list('silent_data_directories', ['./emg_data/silent_parallel_data']
 flags.DEFINE_list('voiced_data_directories', ['./emg_data/voiced_parallel_data','./emg_data/nonparallel_data'], 'voiced data locations')
 flags.DEFINE_string('testset_file', 'testset_largedev.json', 'file with testset indices')
 flags.DEFINE_string('text_align_directory', 'text_alignments', 'directory with alignment files')
+flags.DEFINE_boolean('make_normalizers', False, 'compute and save normalizers')
 
 def remove_drift(signal, fs):
     b, a = scipy.signal.butter(3, 2, 'highpass', fs=fs)
@@ -67,6 +68,7 @@ def load_utterance(base_dir, index, limit_length=False, debug=False, text_align_
     x = apply_to_all(notch_harmonics, x, 60, 1000)
     x = apply_to_all(remove_drift, x, 1000)
     x = x[raw_emg_before.shape[0]:x.shape[0]-raw_emg_after.shape[0],:]
+    # 80-bin mel: 86.13 fps (hop=256 @22.05 kHz).
     emg_orig = apply_to_all(subsample, x, 689.06, 1000)
     x = apply_to_all(subsample, x, 516.79, 1000)
     emg = x
@@ -77,8 +79,11 @@ def load_utterance(base_dir, index, limit_length=False, debug=False, text_align_
 
     emg_features = get_emg_features(emg)
 
-    mfccs = load_audio(os.path.join(base_dir, f'{index}_audio_clean.flac'),
-            max_frames=min(emg_features.shape[0], 800 if limit_length else float('inf')))
+    audio_path = os.path.join(base_dir, f'{index}_audio_clean.flac')
+    mfccs = load_audio(
+        audio_path,
+        max_frames=min(emg_features.shape[0], 800 if limit_length else float('inf'))
+    )
 
     if emg_features.shape[0] > mfccs.shape[0]:
         emg_features = emg_features[:mfccs.shape[0],:]
@@ -140,40 +145,90 @@ class SizeAwareSampler(torch.utils.data.Sampler):
         # dropping last incomplete batch
 
 class EMGDataset(torch.utils.data.Dataset):
-    def __init__(self, base_dir=None, limit_length=False, dev=False, test=False, no_testset=False, no_normalizers=False):
+    def __init__(self, base_dir=None, emg_file=None, limit_length=False, dev=False, test=False, no_testset=False, no_normalizers=False):
 
-        self.text_align_directory = FLAGS.text_align_directory
+        self.text_align_directory = getattr(FLAGS, 'text_align_directory', 'text_alignments')
 
+        # ── 檢查是否已指定單一/特定 EMG 檔案 ──────────────────────────
+        # 可由參數 emg_file、base_dir 為檔案路徑、或由 CLI --emg_file 提供
+        if emg_file is None:
+            emg_file = getattr(FLAGS, 'emg_file', None)
+        if emg_file is None and base_dir is not None and (os.path.isfile(base_dir) or str(base_dir).endswith('.npy')):
+            emg_file = base_dir
+        if emg_file is not None and os.path.isdir(emg_file):
+            npy_files = [os.path.join(emg_file, f) for f in sorted(os.listdir(emg_file)) if f.endswith('.npy')]
+            if npy_files:
+                emg_file = npy_files[0]
+
+        self.no_normalizers = no_normalizers
+        if not self.no_normalizers:
+            norm_file = getattr(FLAGS, 'normalizers_file', 'normalizers.pkl')
+            if os.path.exists(norm_file):
+                with open(norm_file, 'rb') as f:
+                    self.mfcc_norm, self.emg_norm = pickle.load(f)
+            else:
+                self.mfcc_norm, self.emg_norm = None, None
+        else:
+            self.mfcc_norm, self.emg_norm = None, None
+
+        self.limit_length = limit_length
+        self.text_transform = TextTransform()
+        self.num_speech_features = 80
+        self.num_features = 8
+        self.num_sessions = 1
+
+        # 若已指定檔案：直接進入單一檔案模式，完全不掃描整個資料夾與 testset
+        if emg_file is not None:
+            self.emg_file = emg_file
+            self.example_indices = [(EMGDirectory(0, os.path.dirname(emg_file) or '.', False), 0)]
+            self.voiced_data_locations = {}
+            return
+
+        # ── 一般完整資料集模式 ───────────────────────────────────────
         if no_testset:
             devset = []
             testset = []
         else:
-            with open(FLAGS.testset_file) as f:
-                testset_json = json.load(f)
-                devset = testset_json['dev']
-                testset = testset_json['test']
+            testset_file = getattr(FLAGS, 'testset_file', 'testset_largedev.json')
+            if os.path.exists(testset_file):
+                with open(testset_file) as f:
+                    testset_json = json.load(f)
+                    devset = testset_json.get('dev', [])
+                    testset = testset_json.get('test', [])
+            else:
+                devset = []
+                testset = []
 
         directories = []
         if base_dir is not None:
             directories.append(EMGDirectory(0, base_dir, False))
         else:
-            for sd in FLAGS.silent_data_directories:
-                for session_dir in sorted(os.listdir(sd)):
-                    directories.append(EMGDirectory(len(directories), os.path.join(sd, session_dir), True))
+            for sd in getattr(FLAGS, 'silent_data_directories', []):
+                if os.path.exists(sd) and os.path.isdir(sd):
+                    for session_dir in sorted(os.listdir(sd)):
+                        s_path = os.path.join(sd, session_dir)
+                        if os.path.isdir(s_path):
+                            directories.append(EMGDirectory(len(directories), s_path, True))
 
-            has_silent = len(FLAGS.silent_data_directories) > 0
-            for vd in FLAGS.voiced_data_directories:
-                for session_dir in sorted(os.listdir(vd)):
-                    directories.append(EMGDirectory(len(directories), os.path.join(vd, session_dir), False, exclude_from_testset=has_silent))
+            has_silent = any(d.silent for d in directories)
+            for vd in getattr(FLAGS, 'voiced_data_directories', []):
+                if os.path.exists(vd) and os.path.isdir(vd):
+                    for session_dir in sorted(os.listdir(vd)):
+                        s_path = os.path.join(vd, session_dir)
+                        if os.path.isdir(s_path):
+                            directories.append(EMGDirectory(len(directories), s_path, False, exclude_from_testset=has_silent))
 
         self.example_indices = []
         self.voiced_data_locations = {} # map from book/sentence_index to directory_info/index
         for directory_info in directories:
+            if not os.path.exists(directory_info.directory):
+                continue
             for fname in os.listdir(directory_info.directory):
                 m = re.match(r'(\d+)_info.json', fname)
                 if m is not None:
                     idx_str = m.group(1)
-                    with open(os.path.join(directory_info.directory, fname)) as f:
+                    info_path = os.path.join(directory_info.directory, fname)
+                    with open(info_path) as f:
                         info = json.load(f)
                         if info['sentence_index'] >= 0: # boundary clips of silence are marked -1
                             location_in_testset = [info['book'], info['sentence_index']] in testset
@@ -191,17 +246,19 @@ class EMGDataset(torch.utils.data.Dataset):
         random.seed(0)
         random.shuffle(self.example_indices)
 
-        self.no_normalizers = no_normalizers
-        if not self.no_normalizers:
-            self.mfcc_norm, self.emg_norm = pickle.load(open(FLAGS.normalizers_file,'rb'))
+        if len(self.example_indices) > 0:
+            try:
+                sample_mfccs, sample_emg, _, _, _, _ = load_utterance(self.example_indices[0][0].directory, self.example_indices[0][1])
+                self.num_speech_features = sample_mfccs.shape[1]
+                self.num_features = sample_emg.shape[1]
+            except Exception:
+                self.num_speech_features = 80
+                self.num_features = 8
+        else:
+            self.num_speech_features = 80
+            self.num_features = 8
 
-        sample_mfccs, sample_emg, _, _, _, _ = load_utterance(self.example_indices[0][0].directory, self.example_indices[0][1])
-        self.num_speech_features = sample_mfccs.shape[1]
-        self.num_features = sample_emg.shape[1]
-        self.limit_length = limit_length
         self.num_sessions = len(directories)
-
-        self.text_transform = TextTransform()
 
     def silent_subset(self):
         result = copy(self)
@@ -222,6 +279,75 @@ class EMGDataset(torch.utils.data.Dataset):
 
     @lru_cache(maxsize=None)
     def __getitem__(self, i):
+        if getattr(self, 'emg_file', None) is not None:
+            raw_emg = np.load(self.emg_file)
+            if raw_emg.ndim == 1:
+                raw_emg = raw_emg.reshape(-1, 8)
+            if raw_emg.shape[0] == 8 and raw_emg.shape[1] > 8:
+                raw_emg = raw_emg.T
+            assert raw_emg.shape[1] == 8, f'EMG 應為 (T, 8), 得到 {raw_emg.shape}'
+
+            # ── 從 info.json 讀取自訂前處理參數 ─────────────────────────
+            # 支援的 JSON 欄位（皆為選填）：
+            #   already_preprocessed : bool   是否已完成 notch/drift/resample (預設 true)
+            #   emg_scale            : float  振幅縮放因子 (預設 0.35)
+            #   raw_sampling_rate    : float  原始取樣率，用於自動判斷與 resample
+            #   target_sampling_rate : float  目標取樣率 (預設 689.06)
+            #   notch_freq           : float  市電頻率，50 或 60 Hz (預設 60)
+            already_preprocessed = True
+            emg_scale = 0.35
+            raw_sr = 689.06
+            target_sr = 689.06
+            notch_freq = 60
+
+            # 嘗試尋找對應的 info.json（支援 trial_XXX_info.json 與 N_info.json 兩種命名）
+            info_path = None
+            emg_base = os.path.splitext(self.emg_file)[0]  # 去掉 .npy
+            if emg_base.endswith('_emg'):
+                info_path = emg_base[:-4] + '_info.json'
+            elif emg_base.endswith('_inference_689hz'):
+                info_path = emg_base[:-len('_inference_689hz')] + '_info.json'
+
+            if info_path and os.path.exists(info_path):
+                with open(info_path) as f:
+                    file_info = json.load(f)
+                already_preprocessed = file_info.get('already_preprocessed', already_preprocessed)
+                emg_scale = file_info.get('emg_scale', emg_scale)
+                raw_sr = file_info.get('raw_sampling_rate', raw_sr)
+                target_sr = file_info.get('target_sampling_rate', target_sr)
+                notch_freq = file_info.get('notch_freq', notch_freq)
+                # 如果 JSON 沒有明確寫 already_preprocessed，從取樣率自動推斷
+                if 'already_preprocessed' not in file_info:
+                    already_preprocessed = (abs(raw_sr - target_sr) < 5)
+
+            logging.info(f'EMG preprocessing: already_preprocessed={already_preprocessed}, '
+                         f'emg_scale={emg_scale}, raw_sr={raw_sr}, notch_freq={notch_freq}')
+
+            if already_preprocessed:
+                # 自錄資料：已完成 notch/drift/resample，只需縮放
+                raw_emg = raw_emg * emg_scale
+            else:
+                # 原始格式：走完整前處理流程（頻率參數皆從 JSON 讀取）
+                raw_emg = apply_to_all(notch_harmonics, raw_emg, notch_freq, raw_sr)
+                raw_emg = apply_to_all(remove_drift, raw_emg, raw_sr)
+                if abs(raw_sr - target_sr) > 1:
+                    raw_emg = apply_to_all(subsample, raw_emg, target_sr, raw_sr)
+
+            for c in getattr(FLAGS, 'remove_channels', []):
+                raw_emg[:, int(c)] = 0
+            raw_emg = raw_emg.astype(np.float32)
+            raw_emg = raw_emg / 20.0
+            raw_emg = 50.0 * np.tanh(raw_emg / 50.0)
+
+            return {
+                'raw_emg': torch.from_numpy(raw_emg),
+                'session_ids': torch.zeros(raw_emg.shape[0], dtype=torch.int64),
+                'text': '',
+                'text_int': torch.zeros(0, dtype=torch.int64),
+                'file_label': 0,
+                'silent': False,
+            }
+
         directory_info, idx = self.example_indices[i]
         mfccs, emg, text, book_location, phonemes, raw_emg = load_utterance(directory_info.directory, idx, self.limit_length, text_align_directory=self.text_align_directory)
         raw_emg = raw_emg / 20
@@ -310,7 +436,11 @@ def make_normalizers():
 
 if __name__ == '__main__':
     FLAGS(sys.argv)
-    d = EMGDataset()
-    for i in range(1000):
-        d[i]
-
+    if FLAGS.make_normalizers or not os.path.exists(FLAGS.normalizers_file):
+        logging.info(f"Generating normalizers -> {FLAGS.normalizers_file}...")
+        make_normalizers()
+        logging.info(f"✅ Normalizers saved to {FLAGS.normalizers_file}")
+    else:
+        d = EMGDataset()
+        for i in range(min(100, len(d))):
+            d[i]
