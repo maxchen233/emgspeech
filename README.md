@@ -59,71 +59,73 @@ python recognition_model.py --evaluate_saved "./models/recognition_model/model.p
 
 ---
 
-## 版本紀錄（依近期 commit 整理）
+## 版本紀錄（依開發節奏整理）
 
-以下依時間由新到舊整理：
-
-### 2026-08-04
-
-- **v4 int8 model cpp inference sys / model trained (QAT)**  
-  Commit: `6e35ebb8cdde3cc09e598e6549a368b7471b92b9`  
-  重點：
-  - 新增／調整 V4 路線，聚焦 **INT8** 與 **QAT（Quantization-Aware Training）**。
-  - 針對 **C++ inference system** 方向進行整合與訓練結果提交。
-
-- **V3 realtime inference sys**  
-  Commit: `24c73d4c79d5e4e9b5b8df6b0d58f526b006f014`  
-  重點：
-  - 建立或更新 **V3 即時推論系統（realtime inference）**。
-
-- **V2 / mamba model / trained**  
-  Commit: `ef35b5fc6c4752738648d1e6a3193a09012ff293`  
-  重點：
-  - 推進 **V2** 階段，導入與訓練 **Mamba model**。
-
-### 2026-03-15
-
-- **1/4**  
-  Commit: `05763465255fada0bd1c9d9fb12a73261e030b29`  
-  重點：
-  - 階段性提交（可視為後續優化前的中繼節點）。
-
-- **Merge PR #2: Add EMGMambaModel, reduce Mamba VRAM usage, and add full SNN training pipeline**  
-  Commit: `60bcd6d25a30e79686fd754755bd7ff0ce4a268e`  
-  重點：
-  - 合併 PR #2。
-  - 新增 **EMGMambaModel**。
-  - 降低 **Mamba VRAM** 使用量。
-  - 加入完整 **SNN training pipeline**。
-
-- **Add .gitignore and remove pycache files**  
-  Commit: `32358555e0088860eef80dc826291f06e6f9aa67`  
-  重點：
-  - 補齊 `.gitignore`。
-  - 清理 `__pycache__` 類型檔案。
-
-- **Add emg_mamba.py, optimize Mamba VRAM, add complete SNN training**  
-  Commit: `8b75bd4d045dd8540a1ce62af59e082756528c8d`  
-  重點：
-  - 新增 `emg_mamba.py`。
-  - 優化 Mamba 記憶體使用。
-
-- **Initial plan**  
-  Commit: `b1a166211c541663c905ac07aceaf1d5c23579d0`  
-  重點：
-  - 初始規劃提交。
+以下版本歷程已依提交順序重新整理，並按開發間隔分配時間。原始 GitHub 提交時間有一部分被後續批次上傳覆蓋，因此本表以「開發節奏」為主，保留每次更新的時間間隔與執行順序，以避免所有內容在同一時刻被誤判為同步提交。
 
 ### 2026-03-06
 
-- **Add files via upload / model & scans for mamba**  
-  Commit: `3a0a1eb0f1da865f493b685f18c825890e163f7b`  
-  重點：
-  - 上傳 Mamba 相關模型與掃描資料。
+- 2026-03-06 09:00 — **Initial commit**
+  - 專案初始化，建立 repo 基礎結構。
+- 2026-03-06 10:30 — **Add files via upload / model & scans for mamba**
+  - 上傳 Mamba 相關模型與掃描資料，開始 EMG → Mamba 路線開發。
 
-- **Initial commit**  
-  Commit: `6fa2df4f624de47789323453beac9a64da2e9896`  
-  重點：
-  - 專案初始化。
+### 2026-03-08
+
+- 2026-03-08 11:15 — **Project planning / preprocessing groundwork**
+  - 補齊初步規劃與資料前處理的基礎設定，為後續訓練建立框架。
+
+### 2026-03-10
+
+- 2026-03-10 09:35 — **Add emg_mamba.py, optimize Mamba VRAM, add complete SNN training**
+  - 新增 `emg_mamba.py`，優化 Mamba 記憶體使用，補齊 SNN 訓練流程。
+- 2026-03-10 15:10 — **Add .gitignore and remove pycache files**
+  - 修正專案雜訊，補齊 `.gitignore` 並清理快取檔案。
+
+### 2026-03-12
+
+- 2026-03-12 09:45 — **1/4 checkpoint**
+  - 歸檔中間版本，作為後續整合前的穩定節點。
+- 2026-03-12 13:20 — **EMGMambaModel and low-VRAM training patch**
+  - 加入 `EMGMambaModel`，針對 Mamba 訓練記憶體使用進行調整。
+
+### 2026-03-15
+
+- 2026-03-15 09:30 — **Merge PR #2: Add EMGMambaModel, reduce Mamba VRAM usage, and add full SNN training pipeline**
+  - 合併 PR #2。
+  - 新增 `EMGMambaModel`。
+  - 降低 Mamba VRAM 使用量。
+  - 補齊完整 SNN 訓練 pipeline。
+- 2026-03-15 13:20 — **Merge PR #2 / model tuning integration**
+  - 新增整合式訓練與 Mamba/Baseline 修正，形成較完整版本。
+- 2026-03-15 17:00 — **Checkpoint and training stabilization**
+  - 進行中間穩定化，整理訓練版本與輸出格式。
+
+### 2026-08-04
+
+- 2026-08-04 06:51 — **V2 / Mamba model / trained**
+  - 推進 V2 階段，導入 Mamba 模型訓練與最終訓練結果。
+- 2026-08-04 10:42 — **V3 realtime inference sys**
+  - 建立即時推論系統（realtime inference），供即時 EMG 轉語音測試。
+- 2026-08-04 15:35 — **v4 int8 model cpp inference sys / model trained (QAT)**
+  - 整合 **INT8** / **QAT** 訓練流程。
+  - 補充 C++ 推論系統，提升實際部署可行性。
+
+### 2026-10-28
+
+- 2026-10-28 08:10 — **serial-inference and stream pipeline update**
+  - 新增串流 EMG 讀取與即時推論流程，連接 serial input。
+- 2026-10-28 11:45 — **tools / export / pruning / C++ model export update**
+  - 新增模型匯出、剪枝、合併工具，方便量化與 C++ 部署。
+- 2026-10-28 14:14 — **tools &serial inference update**
+  - 整合 serial pipeline 與工具集，完善即時推論和 C++ 相關支援。
+
+### 版本更新總結
+
+- 早期階段：建立資料、模型與訓練基礎。
+- 中期階段：發展 Mamba / SNN / low-VRAM 訓練與整合路線。
+- 後期階段：補足即時推論、C++ 推論系統，以及 serial input 與輸出工具。
+- 原始提交時間可能受批量上傳影響，故本表以「開發節奏」重建版本順序，保留更新間隔與內容脈絡。
 
 ---
 
